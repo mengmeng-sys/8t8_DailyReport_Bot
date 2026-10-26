@@ -185,7 +185,7 @@ def expense_screen(s, note=""):
 def done_screen(s):
     sm = summarize(s["data"])
     return (f"✅ Report {dmy(s['date'])} saved\nRevenue {sm['total']:g} · Expenses {sm['expenses']:g}\n\n"
-            "Your xlsx file is below 👇",
+            "Your xlsx file is above ☝️\nIt leaves the chat when you start the next task.\nYou can get it again any time from 📚 History.",
             Markup([[Btn("✏️ Change something", callback_data="m:main")],
                     [Btn("📚 History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")]]))
 
@@ -281,6 +281,13 @@ async def respond(update, ctx, screen):
 _TASKS = set()
 
 
+def background(coro):
+    """Run something at the same time, without making you wait for it."""
+    t = asyncio.create_task(coro)
+    _TASKS.add(t)
+    t.add_done_callback(_TASKS.discard)
+
+
 def answer_later(q, text=None):
     """Answer the button tap at the same time as editing the screen (faster)."""
     async def run():
@@ -288,26 +295,53 @@ def answer_later(q, text=None):
             await q.answer(text)
         except Exception:
             pass
-    t = asyncio.create_task(run())
-    _TASKS.add(t)
-    t.add_done_callback(_TASKS.discard)
+    background(run())
+
+
+async def delete_messages(ctx, ids):
+    for mid in ids:
+        try:
+            await ctx.bot.delete_message(OWNER, mid)
+        except Exception:      # already deleted, or too old for Telegram to allow
+            pass
+
+
+def clear_files_later(ctx):
+    """Take the xlsx files the bot sent out of the chat (they stay in History)."""
+    ids = ctx.user_data.pop("files", [])
+    if ids:
+        background(delete_messages(ctx, ids))
 
 
 async def send_report(ctx, data, iso):
-    """Make the xlsx from your template and send ONLY the file."""
+    """Make the xlsx from your template and send ONLY the file. Returns the message id."""
     path = os.path.join(tempfile.gettempdir(), file_name(iso))
     try:
         fill_template(data, path, report_date=datetime.strptime(iso, "%Y-%m-%d").date())
         with open(path, "rb") as f:
-            await ctx.bot.send_document(OWNER, f, filename=file_name(iso))
+            msg = await ctx.bot.send_document(OWNER, f, filename=file_name(iso))
+        return msg.message_id
     finally:
         if os.path.exists(path):
             os.remove(path)
 
 
+async def deliver_file(ctx, data, iso, screen, old_panel_id):
+    """Old files out -> new file in -> a fresh menu UNDER the file, so the menu you use is always last."""
+    clear_files_later(ctx)
+    file_id = await send_report(ctx, data, iso)
+    ctx.user_data.setdefault("files", []).append(file_id)
+    msg = await ctx.bot.send_message(OWNER, screen[0], reply_markup=screen[1])
+    ctx.user_data["panel"] = msg.message_id
+    if old_panel_id:
+        background(delete_messages(ctx, [old_panel_id]))
+
+
 # ---------- commands ----------
 async def home_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("waiting", None)
+    old = ctx.user_data.get("panel")
+    background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
     text, markup = home_screen()
     msg, _ = await asyncio.gather(update.message.reply_text(text, reply_markup=markup), tidy(update))
     ctx.user_data["panel"] = msg.message_id
@@ -327,9 +361,15 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.message.chat.id != OWNER:
         return
     cmd = q.data
+    current = ctx.user_data.get("panel")
+    if current and q.message.message_id != current:        # an old menu higher up in the chat
+        answer_later(q, "Old menu removed. Please use the last message.")
+        return background(delete_messages(ctx, [q.message.message_id]))
     ctx.user_data["panel"] = q.message.message_id
     if cmd != "act:generate":
         answer_later(q, "Sending file..." if cmd.startswith("h:f:") else None)
+    if cmd != "act:generate" and not cmd.startswith("h:f:"):
+        clear_files_later(ctx)                              # new task: the old file leaves the chat
 
     # ----- home and history -----
     if cmd == "home":
@@ -352,7 +392,9 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "v":                                   # open one report
             return await show(q, (preview_text(complete(data), iso), report_view_markup(iso)))
         if action == "f":                                   # send its file again
-            return await send_report(ctx, complete(data), iso)
+            return await deliver_file(ctx, complete(data), iso,
+                                      (preview_text(complete(data), iso), report_view_markup(iso)),
+                                      q.message.message_id)
         if action == "e":                                   # update (edit) it
             return await show(q, report_screen(start_session(ctx, iso, explicit=True)))
         if action == "d":                                   # ask before deleting
@@ -405,8 +447,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             history.save_report(s["date"], data)            # saved in History (replaces the same day)
             s["saved"] = True
-            await send_report(ctx, data, s["date"])
-            await asyncio.gather(q.answer("✅ Saved to history"), show(q, done_screen(s)))
+            await deliver_file(ctx, data, s["date"], done_screen(s), q.message.message_id)
+            await q.answer("✅ Saved to history")
         except Exception:
             logging.exception("could not make the report")
             await q.answer("Sorry, could not make the file", show_alert=True)
@@ -416,6 +458,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     w = ctx.user_data.get("waiting")
+    clear_files_later(ctx)
 
     if w and w[0] == "newdate":
         m = re.search(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", text)
@@ -480,8 +523,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- evening reminder ----------
 async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    ud = ctx.user_data if ctx.user_data is not None else {}
+    old = ud.get("panel")
+    background(delete_messages(ctx, ud.pop("files", []) + ([old] if old else [])))
     text, markup = home_screen()
-    await ctx.bot.send_message(OWNER, "⏰ Time for today's hostel report.\n\n" + text, reply_markup=markup)
+    msg = await ctx.bot.send_message(OWNER, "⏰ Time for today's hostel report.\n\n" + text, reply_markup=markup)
+    ud["panel"] = msg.message_id
 
 
 def make_request():
@@ -494,17 +541,47 @@ def make_request():
                         write_timeout=15, **kwargs)
 
 
+def start_health_server():
+    """Only used when the bot runs as a Render *Web Service* (Render sets PORT).
+    It answers "ok" to web visits, so an uptime pinger can keep the free service awake."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    class Health(BaseHTTPRequestHandler):
+        def _ok(self, body=b""):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._ok(b"ok")
+
+        def do_HEAD(self):
+            self._ok()
+
+        def log_message(self, *args):  # keep the logs clean
+            pass
+
+    Thread(target=HTTPServer(("0.0.0.0", int(port)), Health).serve_forever, daemon=True).start()
+    print(f"Health page on port {port}")
+
+
 def main():
+    start_health_server()
     app = (Application.builder().token(TOKEN)
            .request(make_request()).get_updates_request(make_request())
-           .persistence(PicklePersistence(filepath=str(Path(__file__).parent / "bot_data.pickle")))
+           .persistence(PicklePersistence(filepath=str(history.DATA_DIR / "bot_data.pickle")))
            .concurrent_updates(True)   # a slow click does not make the next click wait
            .build())
     only_me = filters.Chat(chat_id=OWNER)
     app.add_handler(CommandHandler(["start", "menu"], home_cmd, filters=only_me))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
-    app.job_queue.run_daily(reminder, time=time(20, 0, tzinfo=TZ))  # 20:00 Cambodia time
+    app.job_queue.run_daily(reminder, time=time(20, 0, tzinfo=TZ), user_id=OWNER, chat_id=OWNER)  # 20:00 Cambodia time
     print("Bot is running")
     app.run_polling()
 

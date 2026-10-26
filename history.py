@@ -1,9 +1,16 @@
 # history.py - saves every report you make, so you can open, update or delete it later
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
-HISTORY_DIR = Path(__file__).parent / "history"   # one small file per day: 2026-10-26.json
+from dotenv import load_dotenv
+
+load_dotenv()
+# DATA_DIR = where your data is kept. On your computer: leave it empty (the bot folder is used).
+# On Render: set DATA_DIR=/var/data (the persistent disk), or History is lost on every restart.
+DATA_DIR = Path(os.getenv("DATA_DIR") or Path(__file__).parent)
+HISTORY_DIR = DATA_DIR / "history"   # one small file per day: 2026-10-26.json
 
 
 def _path(iso):

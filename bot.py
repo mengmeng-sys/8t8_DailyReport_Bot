@@ -251,18 +251,42 @@ def group_screen(s, group, note=""):
     return text, Markup(rows)
 
 
-def prompt_screen(title, example, back, note="", extra=""):
+# Common cash amounts for quick buttons (cash | 0 | 0)
+QUICK_AMOUNTS = [0, 10, 20, 30, 40, 50, 60, 80, 100, 150]
+
+
+def _quick_rows(prefix: str):
+    """Build rows of quick-amount buttons. prefix example: 'q:rooms:pool' or 'q:bar'"""
+    buttons = [Btn(str(a) if a else "Clear", callback_data=f"{prefix}:{a}") for a in QUICK_AMOUNTS]
+    # 5 buttons per row
+    rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+    return rows
+
+
+def prompt_screen(title, example, back, note="", extra="", quick_prefix=None):
     text = ((esc(note) + "\n\n") if note else "") + f"<b>{title}</b>\n\n{extra}Type it now.\nExample: <code>{example}</code>"
-    return text, Markup([[Btn("⬅️ Back", callback_data=back)]])
+    rows = []
+    if quick_prefix:
+        rows += _quick_rows(quick_prefix)
+        text += "\n\nOr tap a quick amount (cash only):"
+    rows.append([Btn("⬅️ Back", callback_data=back)])
+    return text, Markup(rows)
 
 
 def item_prompt(group, key, note=""):
-    return prompt_screen(LABELS[group][key], "40 0 20", f"m:{group}", note,
-                         "3 numbers: cash card aba\n(one number = cash only, 0 = clear)\n")
+    return prompt_screen(
+        LABELS[group][key], "40 0 20", f"m:{group}", note,
+        "3 numbers: cash card aba\n(one number = cash only, 0 = clear)\n",
+        quick_prefix=f"q:{group}:{key}",
+    )
 
 
 def bar_prompt(note=""):
-    return prompt_screen("🍽 Bar / Restaurant", "50 10 5", "m:main", note, "3 numbers: cash card aba\n")
+    return prompt_screen(
+        "🍽 Bar / Restaurant", "50 10 5", "m:main", note,
+        "3 numbers: cash card aba\n",
+        quick_prefix="q:bar",
+    )
 
 
 def discount_prompt(note=""):
@@ -286,16 +310,19 @@ def expense_screen(s, note=""):
 def step_screen(s, idx, note=""):
     step, data = STEPS[idx], s["data"]
     lines = ([esc(note), ""] if note else []) + [f"<b>STEP {idx + 1} of {len(STEPS)}</b> · {dmy(s['date'])}", ""]
+    quick_prefix = None
     if step[0] == "item":
         _, group, key = step
         cur = data[group].get(key)
         lines += [f"<b>{TITLES[group]} › {LABELS[group][key]}</b>", "Type 3 numbers: cash card aba",
                   "Example: <code>40 0 20</code>"]
         now = short(cur) if cur and sum(three(cur)) else None
+        quick_prefix = f"q:{group}:{key}"
     elif step[0] == "bar":
         cur = data["bar"]
         lines += ["<b>🍽 Bar / Restaurant</b>", "Type 3 numbers: cash card aba", "Example: <code>50 10 5</code>"]
         now = short(cur) if sum(three(cur)) else None
+        quick_prefix = "q:bar"
     elif step[0] == "discount":
         d = data["discount"]
         lines += ["<b>🏷 Discount</b> (optional)", "Type the amount, then the reason",
@@ -309,6 +336,13 @@ def step_screen(s, idx, note=""):
         lines += ["", f"Now: {now}"]
     if step[0] != "expense":
         lines += ["", "Nothing today? Tap Skip."]
+    if quick_prefix:
+        lines += ["", "Or tap a quick amount (cash only):"]
+
+    rows = []
+    if quick_prefix:
+        rows += _quick_rows(quick_prefix)
+
     nav = []
     if step[0] == "expense":
         if data["expenses"]:
@@ -318,7 +352,9 @@ def step_screen(s, idx, note=""):
         nav.append(Btn("⏭ Skip", callback_data="g:next"))
     if idx > 0:
         nav.append(Btn("⬅️ Back", callback_data="g:back"))
-    return "\n".join(lines), Markup([nav, [Btn("☰ Menu", callback_data="g:stop")]])
+    rows.append(nav)
+    rows.append([Btn("☰ Menu", callback_data="g:stop")])
+    return "\n".join(lines), Markup(rows)
 
 
 def enter_step(ctx, s, idx, note=""):
@@ -602,7 +638,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         answer_later(q, "Sending file..." if cmd.startswith("h:f:") else None)
     if cmd != "act:generate" and not cmd.startswith("h:f:"):
         clear_files_later(ctx)                              # new task: the old file leaves the chat
-    if not cmd.startswith(("g:", "w:", "exp:")) and cmd not in ("act:generate", "review"):
+    if not cmd.startswith(("g:", "w:", "exp:", "q:")) and cmd not in ("act:generate", "review"):
         for k in ("guided", "pending"):                     # leaving step-by-step / a warning
             ctx.user_data.pop(k, None)
 
@@ -692,6 +728,31 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif cmd == "in:expense":
         ctx.user_data["waiting"] = ("expense",)
         await show(q, expense_screen(s))
+    # ----- quick amount buttons (cash only) -----
+    elif cmd.startswith("q:"):
+        parts = cmd.split(":")
+        # q:bar:50  or  q:rooms:pool:40
+        if len(parts) == 3 and parts[1] == "bar":
+            amount = float(parts[2])
+            nums = [amount, 0, 0]
+            cap = unusual(s, nums, "bar")
+            if cap:
+                ctx.user_data["pending"] = ("bar", None, None, nums)
+                await show(q, warn_screen("Bar", nums, cap))
+            else:
+                await show(q, commit_bar(ctx, s, nums))
+        elif len(parts) == 4:
+            _, group, key, amount_str = parts
+            amount = float(amount_str)
+            nums = [amount, 0, 0]
+            cap = unusual(s, nums, "item", group, key)
+            if cap:
+                ctx.user_data["pending"] = ("item", group, key, nums)
+                await show(q, warn_screen(LABELS[group][key], nums, cap))
+            else:
+                await show(q, commit_item(ctx, s, group, key, nums))
+        else:
+            await show(q, report_screen(s))
     elif cmd == "exp:undo":
         note = ""
         if data["expenses"]:

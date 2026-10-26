@@ -1,16 +1,17 @@
-# bot.py - Telegram bot with ONE screen that updates (no long chat of old menus)
-#   Home -> Start -> fill the report -> Finish (file is sent) -> History (open / update / delete)
-import asyncio, copy, logging, os, re, tempfile
+# bot.py - Telegram bot: clean aligned screens, step-by-step entry, review before sending,
+# always-visible shortcuts, History (open / update / delete), chat cleans itself.
+import asyncio, copy, html, logging, os, re, tempfile
 from datetime import datetime, time
-from pathlib import Path
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup, Update
+from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
+                      KeyboardButton, ReplyKeyboardMarkup, Update)
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, Defaults,
                           MessageHandler, PicklePersistence, filters)
 from telegram.request import HTTPXRequest
 
@@ -37,16 +38,35 @@ def reminder_time():
         logging.warning("REMINDER_TIME %r is not HH:MM, using 21:30", raw)
         return time(21, 30, tzinfo=TZ)
 
+
 LABELS = {
     "rooms": {"pool": "Pool view", "city": "City view", "double_twin": "Double/Twin",
               "pod": "Pod", "dorm4": "4-bed dorm", "dorm6": "6-bed dorm"},
     "tours": {"killing_field": "Killing Field", "bus": "Bus transport", "scooter": "Scooter hire",
               "airport": "Airport pick up", "sunset_boat": "Sunset boat", "night_city": "Night city tour"},
 }
+SHORT = {   # short names for the aligned table
+    "rooms": {"pool": "Pool view", "city": "City view", "double_twin": "Double/Twin",
+              "pod": "Pod", "dorm4": "4-bed dorm", "dorm6": "6-bed dorm"},
+    "tours": {"killing_field": "Killing Field", "bus": "Bus", "scooter": "Scooter",
+              "airport": "Airport", "sunset_boat": "Sunset boat", "night_city": "Night city"},
+}
 TITLES = {"rooms": "🛏 Rooms", "tours": "🧳 Tours"}
+
+# the step-by-step order
+STEPS = ([("item", "rooms", k) for k in LABELS["rooms"]] + [("item", "tours", k) for k in LABELS["tours"]]
+         + [("bar",), ("discount",), ("expense",)])
+
+SHORTCUTS = ReplyKeyboardMarkup([[KeyboardButton("📝 Today"), KeyboardButton("📚 History")]],
+                                resize_keyboard=True, is_persistent=True,
+                                input_field_placeholder="Tap a button, or type numbers")
+SHORTCUT_TEXTS = ("📝 Today", "📚 History")
 
 
 # ---------- small helpers ----------
+esc = html.escape
+
+
 def today_iso():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
@@ -85,18 +105,38 @@ def numbers(text):
     return out
 
 
+def n(v):
+    v = float(v)
+    return f"{int(v):,}" if v == int(v) else f"{v:,.2f}"
+
+
 def fmt(v):
     c, k, a = three(v)
-    return f"cash {c:g} | card {k:g} | aba {a:g}"
+    return f"cash {n(c)} | card {n(k)} | aba {n(a)}"
 
 
 def short(v):
     c, k, a = three(v)
-    return f"{c:g} | {k:g} | {a:g}"
+    return f"{n(c)} | {n(k)} | {n(a)}"
 
 
 def filled(data, group):
     return sum(1 for v in data[group].values() if sum(three(v)))
+
+
+def dots(k, total=6):
+    return "●" * k + "○" * (total - k)
+
+
+def method_totals(data):
+    t = [0, 0, 0]
+    for group in ("rooms", "tours"):
+        for v in data[group].values():
+            for i, x in enumerate(three(v)):
+                t[i] += x
+    for i, x in enumerate(three(data["bar"])):
+        t[i] += x
+    return t
 
 
 # ---------- the report you are working on ("session") ----------
@@ -106,7 +146,8 @@ def start_session(ctx, iso, explicit=False):
         "date": iso, "explicit": explicit, "saved": saved is not None,
         "data": complete(copy.deepcopy(saved)) if saved else fresh(),
     }
-    ctx.user_data.pop("waiting", None)
+    for k in ("waiting", "guided", "pending"):
+        ctx.user_data.pop(k, None)
     return ctx.user_data["session"]
 
 
@@ -118,11 +159,50 @@ def get_session(ctx):
     return s
 
 
+# ---------- the aligned table ----------
+W = 13
+
+
+def trow(label, v):
+    c, k, a = three(v)
+    return f"{label:<{W}}{n(c):>7}{n(k):>7}{n(a):>7}"
+
+
+def table_block(data):
+    lines = [f"{'':<{W}}{'CASH':>7}{'CARD':>7}{'ABA':>7}"]
+    for group, title in (("rooms", "ROOMS"), ("tours", "TOURS")):
+        rows = [trow(SHORT[group][k], data[group][k]) for k in LABELS[group]
+                if data[group].get(k) and sum(three(data[group][k]))]
+        if rows:
+            lines += [title] + rows
+    if sum(three(data["bar"])):
+        lines += ["BAR", trow("Bar", data["bar"])]
+    lines += ["-" * (W + 21), trow("TOTAL", method_totals(data))]
+    return "\n".join(lines)
+
+
+def report_body(data, iso, title):
+    sm, d = summarize(data), data["discount"]
+    empty = not any(sum(three(v)) for g in ("rooms", "tours") for v in data[g].values()) \
+        and not sum(three(data["bar"]))
+    parts = [f"<b>{title}</b> · {dmy(iso)}", ""]
+    if empty:
+        parts += ["<i>Nothing filled yet.</i>"]
+    else:
+        parts += [f"<pre>{esc(table_block(data))}</pre>", f"💰 <b>Revenue {n(sm['total'])}</b>"]
+    if d.get("amount"):
+        parts.append(f"🏷 Discount {n(d['amount'])}" + (f" · {esc(d['reason'])}" if d.get("reason") else ""))
+    if data["expenses"]:
+        items = "\n".join(f"{e['name']}: {n(e['amount'])}" for e in data["expenses"])
+        parts += [f"💸 Expenses {n(sm['expenses'])}", f"<pre>{esc(items)}</pre>"]
+    return "\n".join(parts)
+
+
 # ---------- screens: each returns (text, buttons) ----------
 def home_screen():
     saved = history.load_report(today_iso()) is not None
-    text = ("🏨 Hostel report\n\n"
-            + ("Today's report is already saved.\n" if saved else "Today's report is not made yet.\n")
+    text = ("<b>🏨 Hostel report</b>\n\n"
+            + ("Today's report is already saved ✅\n" if saved else "Today's report is not made yet.\n")
             + "What do you want to do?")
     start = "✏️ Update today's report" if saved else "▶️ Start today's report"
     return text, Markup([
@@ -133,29 +213,35 @@ def home_screen():
 
 def report_screen(s, note=""):
     data, sm, d = s["data"], summarize(s["data"]), s["data"]["discount"]
-    head = "✏️ Updating report" if s.get("saved") else "📝 New report"
-    lines = ([note, ""] if note else []) + [
-        f"{head} · {dmy(s['date'])}", "",
-        f"🛏 Rooms: {filled(data, 'rooms')} of 6 filled",
-        f"🧳 Tours: {filled(data, 'tours')} of 6 filled",
-        f"🍽 Bar: {sm['bar']:g}" if sm["bar"] else "🍽 Bar: -",
-        f"🏷 Discount: {d['amount']:g}" if d.get("amount") else "🏷 Discount: -",
-        f"💸 Expenses: {len(data['expenses'])} item(s) · {sm['expenses']:g}" if data["expenses"] else "💸 Expenses: -",
-        "", f"💰 Revenue so far: {sm['total']:g}", "",
-        "Tap an item to fill it. When you are done, tap ✅ Finish.",
+    mode = "Updating saved report" if s.get("saved") else "New report"
+    rooms, tours = filled(data, "rooms"), filled(data, "tours")
+    rows = [
+        f"{'Rooms':<10}{dots(rooms)}  {rooms}/6",
+        f"{'Tours':<10}{dots(tours)}  {tours}/6",
+        f"{'Bar':<10}{n(sm['bar'])}" if sm["bar"] else f"{'Bar':<10}-",
+        f"{'Discount':<10}{n(d['amount'])}" if d.get("amount") else f"{'Discount':<10}-",
+        f"{'Expenses':<10}{len(data['expenses'])} item(s) · {n(sm['expenses'])}" if data["expenses"]
+        else f"{'Expenses':<10}-",
     ]
-    return "\n".join(lines), Markup([
-        [Btn("🛏 Rooms", callback_data="m:rooms"), Btn("🧳 Tours", callback_data="m:tours")],
-        [Btn("🍽 Bar", callback_data="in:bar"), Btn("🏷 Discount", callback_data="in:discount")],
-        [Btn("💸 Expenses", callback_data="in:expense")],
-        [Btn("✅ Finish - send me the xlsx file", callback_data="act:generate")],
+    cash, card, aba = method_totals(data)
+    text = ((esc(note) + "\n\n") if note else "") + (
+        f"<b>🏨 HOSTEL REPORT</b> · {dmy(s['date'])}\n<i>{mode}</i>\n\n"
+        f"<pre>{esc(chr(10).join(rows))}</pre>"
+        f"<pre>{'':<10}{'CASH':>7}{'CARD':>7}{'ABA':>7}\n{'Total':<10}{n(cash):>7}{n(card):>7}{n(aba):>7}</pre>"
+        f"💰 <b>Revenue {n(sm['total'])}</b>")
+    return text, Markup([
+        [Btn("▶️ Fill step by step", callback_data="g:start")],
+        [Btn("🛏 Rooms", callback_data="m:rooms"), Btn("🧳 Tours", callback_data="m:tours"),
+         Btn("🍽 Bar", callback_data="in:bar")],
+        [Btn("🏷 Discount", callback_data="in:discount"), Btn("💸 Expenses", callback_data="in:expense")],
+        [Btn("📋 Review & finish", callback_data="review")],
         [Btn("🏠 Home", callback_data="home"), Btn("🗑 Clear all", callback_data="act:reset")],
     ])
 
 
 def group_screen(s, group, note=""):
     data = s["data"]
-    text = (note + "\n\n" if note else "") + f"{TITLES[group]}\nTap one, then type its numbers."
+    text = ((esc(note) + "\n\n") if note else "") + f"<b>{TITLES[group]}</b>\nTap one, then type its numbers."
     rows = []
     for key, label in LABELS[group].items():
         vals = data[group].get(key)
@@ -166,7 +252,7 @@ def group_screen(s, group, note=""):
 
 
 def prompt_screen(title, example, back, note="", extra=""):
-    text = (note + "\n\n" if note else "") + f"{title}\n\n{extra}Type it now.\nExample: {example}"
+    text = ((esc(note) + "\n\n") if note else "") + f"<b>{title}</b>\n\n{extra}Type it now.\nExample: <code>{example}</code>"
     return text, Markup([[Btn("⬅️ Back", callback_data=back)]])
 
 
@@ -183,49 +269,106 @@ def discount_prompt(note=""):
     return prompt_screen("🏷 Discount", "5 long stay", "m:main", note, "The amount, then the reason\n")
 
 
+def expense_lines(s):
+    items = s["data"]["expenses"]
+    lines = [f"{i}. {esc(e['name'])}: {n(e['amount'])}" for i, e in enumerate(items, 1)] or ["<i>(none yet)</i>"]
+    return lines + ["", f"Total: <b>{n(sum(e['amount'] for e in items))}</b>"]
+
+
 def expense_screen(s, note=""):
     items = s["data"]["expenses"]
-    lines = ([note, ""] if note else []) + ["💸 Expenses", ""]
-    lines += [f"{i}. {e['name']}: {e['amount']:g}" for i, e in enumerate(items, 1)] or ["(none yet)"]
-    lines += ["", f"Total: {sum(e['amount'] for e in items):g}", "",
-              "Type the next one: name then amount\nExample: water 12"]
+    lines = ([esc(note), ""] if note else []) + ["<b>💸 Expenses</b>", ""] + expense_lines(s) + [
+        "", "Type the next one: name then amount", "Example: <code>water 12</code>"]
     row = ([Btn("↩️ Undo last", callback_data="exp:undo")] if items else []) + [Btn("✅ Done", callback_data="m:main")]
     return "\n".join(lines), Markup([row])
 
 
+def step_screen(s, idx, note=""):
+    step, data = STEPS[idx], s["data"]
+    lines = ([esc(note), ""] if note else []) + [f"<b>STEP {idx + 1} of {len(STEPS)}</b> · {dmy(s['date'])}", ""]
+    if step[0] == "item":
+        _, group, key = step
+        cur = data[group].get(key)
+        lines += [f"<b>{TITLES[group]} › {LABELS[group][key]}</b>", "Type 3 numbers: cash card aba",
+                  "Example: <code>40 0 20</code>"]
+        now = short(cur) if cur and sum(three(cur)) else None
+    elif step[0] == "bar":
+        cur = data["bar"]
+        lines += ["<b>🍽 Bar / Restaurant</b>", "Type 3 numbers: cash card aba", "Example: <code>50 10 5</code>"]
+        now = short(cur) if sum(three(cur)) else None
+    elif step[0] == "discount":
+        d = data["discount"]
+        lines += ["<b>🏷 Discount</b> (optional)", "Type the amount, then the reason",
+                  "Example: <code>5 long stay</code>"]
+        now = f"{n(d['amount'])} {esc(d.get('reason', ''))}".strip() if d.get("amount") else None
+    else:  # expense
+        lines += ["<b>💸 Expenses</b> (optional)", ""] + expense_lines(s) + [
+            "", "Type each one: name then amount", "Example: <code>water 12</code>", "Tap Done when finished."]
+        now = None
+    if now:
+        lines += ["", f"Now: {now}"]
+    if step[0] != "expense":
+        lines += ["", "Nothing today? Tap Skip."]
+    nav = []
+    if step[0] == "expense":
+        if data["expenses"]:
+            nav.append(Btn("↩️ Undo last", callback_data="exp:undo"))
+        nav.append(Btn("✅ Done", callback_data="g:next"))
+    else:
+        nav.append(Btn("⏭ Skip", callback_data="g:next"))
+    if idx > 0:
+        nav.append(Btn("⬅️ Back", callback_data="g:back"))
+    return "\n".join(lines), Markup([nav, [Btn("☰ Menu", callback_data="g:stop")]])
+
+
+def enter_step(ctx, s, idx, note=""):
+    """Go to a step of the guided entry (after the last step: the review)."""
+    if idx >= len(STEPS):
+        for k in ("guided", "waiting"):
+            ctx.user_data.pop(k, None)
+        return review_screen(s, note)
+    idx = max(0, idx)
+    ctx.user_data["guided"] = idx
+    ctx.user_data["waiting"] = STEPS[idx]
+    return step_screen(s, idx, note)
+
+
+def expense_view(ctx, s, note=""):
+    g = ctx.user_data.get("guided")
+    return step_screen(s, g, note) if g is not None else expense_screen(s, note)
+
+
+def review_screen(s, note=""):
+    data = s["data"]
+    empty = not any(sum(three(v)) for grp in ("rooms", "tours") for v in data[grp].values()) \
+        and not sum(three(data["bar"])) and not data["expenses"]
+    text = ((esc(note) + "\n\n") if note else "") + report_body(data, s["date"], "📋 REVIEW")
+    text += ("\n\n⚠️ The report is empty." if empty else "") + "\n\nIs everything correct?"
+    return text, Markup([
+        [Btn("✅ Confirm - send me the xlsx", callback_data="act:generate")],
+        [Btn("✏️ Fix something", callback_data="m:main")],
+    ])
+
+
 def done_screen(s):
     sm = summarize(s["data"])
-    return (f"✅ Report {dmy(s['date'])} saved\nRevenue {sm['total']:g} · Expenses {sm['expenses']:g}\n\n"
-            "Your xlsx file is above ☝️\nIt leaves the chat when you start the next task.\nYou can get it again any time from 📚 History.",
+    return (f"✅ <b>Report {dmy(s['date'])} saved</b>\n💰 Revenue {n(sm['total'])} · 💸 Expenses {n(sm['expenses'])}\n\n"
+            "Your xlsx file is above ☝️\nIt leaves the chat when you start the next task.\n"
+            "You can get it again any time from 📚 History.",
             Markup([[Btn("✏️ Change something", callback_data="m:main")],
                     [Btn("📚 History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")]]))
 
 
-def preview_text(data, iso):
-    lines = [f"📋 Report {dmy(iso)}"]
-    for group in ("rooms", "tours"):
-        items = [f"• {LABELS[group][k]}: {fmt(v)}" for k, v in data[group].items() if sum(three(v))]
-        if items:
-            lines += ["", TITLES[group]] + items
-    if sum(three(data["bar"])):
-        lines += ["", "🍽 Bar", "• " + fmt(data["bar"])]
-    if data["discount"].get("amount"):
-        d = data["discount"]
-        lines += ["", f"🏷 Discount: {d['amount']:g} {d.get('reason', '')}".strip()]
-    if data["expenses"]:
-        lines += ["", "💸 Expenses"] + [f"• {e['name']}: {e['amount']:g}" for e in data["expenses"]]
-    if len(lines) == 1:
-        lines.append("\nNothing filled yet.")
-    s = summarize(data)
-    lines += ["", f"Rooms {s['rooms']:g} | Tours {s['tours']:g} | Bar {s['bar']:g}",
-              f"TOTAL revenue: {s['total']:g}", f"Expenses: {s['expenses']:g}"]
-    return "\n".join(lines)
+def warn_screen(label, nums, cap):
+    return (f"⚠️ <b>Please check this number</b>\n\n{esc(label)}: <b>{esc(fmt(nums))}</b>\n"
+            f"The highest in your past reports is <b>{n(cap)}</b>.\nDid you type an extra digit?",
+            Markup([[Btn("✅ Yes, keep it", callback_data="w:ok"), Btn("✏️ Type again", callback_data="w:no")]]))
 
 
 def history_screen(page, note=""):
     items = history.list_reports()
     if not items:
-        return (note + "📚 History\n\nNo reports yet.\nFill a report and tap Finish, and it will appear here.",
+        return (esc(note) + "<b>📚 History</b>\n\nNo reports yet.\nFill a report and confirm it, and it will appear here.",
                 Markup([[Btn("▶️ Start today's report", callback_data="new"), Btn("🏠 Home", callback_data="home")]]))
     pages = (len(items) + PAGE - 1) // PAGE
     page = max(0, min(page, pages - 1))
@@ -233,7 +376,7 @@ def history_screen(page, note=""):
     for iso in items[page * PAGE:(page + 1) * PAGE]:
         data = history.load_report(iso)
         total = summarize(complete(data))["total"] if data else 0
-        rows.append([Btn(f"🗓 {dmy(iso)}  ·  revenue {total:g}", callback_data=f"h:v:{iso}")])
+        rows.append([Btn(f"🗓 {dmy(iso)}  ·  revenue {n(total)}", callback_data=f"h:v:{iso}")])
     nav = []
     if page > 0:
         nav.append(Btn("⬅️ Newer", callback_data=f"hist:{page - 1}"))
@@ -243,7 +386,7 @@ def history_screen(page, note=""):
         rows.append(nav)
     rows.append([Btn("🏠 Home", callback_data="home")])
     noun = "report" if len(items) == 1 else "reports"
-    return f"{note}📚 History ({len(items)} {noun})\nTap one to open it.", Markup(rows)
+    return ((esc(note) + "\n\n" if note else "") + f"<b>📚 History</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
 
 
 def report_view_markup(iso):
@@ -254,13 +397,71 @@ def report_view_markup(iso):
     ])
 
 
+def report_view(data, iso):
+    return report_body(complete(data), iso, "📋 REPORT"), report_view_markup(iso)
+
+
+# ---------- mistake warning: a number far bigger than your past reports ----------
+def past_totals(s, kind, group=None, key=None):
+    out = []
+    for iso in history.list_reports()[:60]:
+        if iso == s["date"]:
+            continue
+        d = history.load_report(iso) or {}
+        v = d.get("bar") if kind == "bar" else (d.get(group) or {}).get(key)
+        total = sum(three(v)) if v else 0
+        if total:
+            out.append(total)
+    return out
+
+
+def unusual(s, nums, kind, group=None, key=None):
+    past = past_totals(s, kind, group, key)
+    if len(past) >= 3 and sum(nums) > 3 * max(past):
+        return max(past)
+    return None
+
+
+def commit_item(ctx, s, group, key, nums):
+    s["data"][group][key] = three(nums)
+    ctx.user_data.pop("pending", None)
+    note = f"✅ {LABELS[group][key]} saved: {fmt(nums)}"
+    g = ctx.user_data.get("guided")
+    if g is not None:
+        return enter_step(ctx, s, g + 1, note)
+    ctx.user_data.pop("waiting", None)
+    return group_screen(s, group, note)
+
+
+def commit_bar(ctx, s, nums):
+    s["data"]["bar"] = three(nums)
+    ctx.user_data.pop("pending", None)
+    note = f"✅ Bar saved: {fmt(nums)}"
+    g = ctx.user_data.get("guided")
+    if g is not None:
+        return enter_step(ctx, s, g + 1, note)
+    ctx.user_data.pop("waiting", None)
+    return report_screen(s, note)
+
+
+def commit_discount(ctx, s, amount, reason):
+    s["data"]["discount"] = {"amount": amount, "reason": reason}
+    note = f"✅ Discount saved: {n(amount)} {reason}".strip()
+    g = ctx.user_data.get("guided")
+    if g is not None:
+        return enter_step(ctx, s, g + 1, note)
+    ctx.user_data.pop("waiting", None)
+    return report_screen(s, note)
+
+
 # ---------- sending screens (one panel message that is edited) ----------
 async def show(q, screen):
     """Button tap: edit the message that was tapped."""
     try:
         await q.edit_message_text(screen[0], reply_markup=screen[1])
-    except BadRequest:  # "message is not modified"
-        pass
+    except BadRequest as e:  # "message is not modified" is fine
+        if "not modified" not in str(e).lower():
+            logging.exception("could not show screen")
 
 
 async def refresh(ctx, screen):
@@ -348,14 +549,34 @@ async def deliver_file(ctx, data, iso, screen, old_panel_id):
         background(delete_messages(ctx, [old_panel_id]))
 
 
-# ---------- commands ----------
-async def home_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.pop("waiting", None)
+# ---------- commands and shortcuts: each opens a FRESH menu at the bottom ----------
+async def open_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, screen):
+    for k in ("waiting", "guided", "pending"):
+        ctx.user_data.pop(k, None)
     old = ctx.user_data.get("panel")
     background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
-    text, markup = home_screen()
-    msg, _ = await asyncio.gather(update.message.reply_text(text, reply_markup=markup), tidy(update))
+    if not ctx.user_data.get("kb"):        # the two shortcut buttons at the bottom (sent once)
+        await update.message.reply_text("⌨️ Shortcuts are now at the bottom of your screen.", reply_markup=SHORTCUTS)
+        ctx.user_data["kb"] = True
+    msg, _ = await asyncio.gather(update.message.reply_text(screen[0], reply_markup=screen[1]), tidy(update))
     ctx.user_data["panel"] = msg.message_id
+
+
+async def home_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await open_panel(update, ctx, home_screen())
+
+
+async def today_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await open_panel(update, ctx, report_screen(start_session(ctx, today_iso())))
+
+
+async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await open_panel(update, ctx, history_screen(0))
+
+
+async def keyboard_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["kb"] = False            # send the shortcut buttons again
+    await open_panel(update, ctx, home_screen())
 
 
 # ---------- button taps ----------
@@ -381,6 +602,9 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         answer_later(q, "Sending file..." if cmd.startswith("h:f:") else None)
     if cmd != "act:generate" and not cmd.startswith("h:f:"):
         clear_files_later(ctx)                              # new task: the old file leaves the chat
+    if not cmd.startswith(("g:", "w:", "exp:")) and cmd not in ("act:generate", "review"):
+        for k in ("guided", "pending"):                     # leaving step-by-step / a warning
+            ctx.user_data.pop(k, None)
 
     # ----- home and history -----
     if cmd == "home":
@@ -399,22 +623,20 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, action, iso = cmd.split(":", 2)
         data = history.load_report(iso)
         if action != "dy" and data is None:
-            return await show(q, history_screen(0, "That report was not found.\n\n"))
+            return await show(q, history_screen(0, "That report was not found."))
         if action == "v":                                   # open one report
-            return await show(q, (preview_text(complete(data), iso), report_view_markup(iso)))
+            return await show(q, report_view(data, iso))
         if action == "f":                                   # send its file again
-            return await deliver_file(ctx, complete(data), iso,
-                                      (preview_text(complete(data), iso), report_view_markup(iso)),
-                                      q.message.message_id)
+            return await deliver_file(ctx, complete(data), iso, report_view(data, iso), q.message.message_id)
         if action == "e":                                   # update (edit) it
             return await show(q, report_screen(start_session(ctx, iso, explicit=True)))
         if action == "d":                                   # ask before deleting
-            return await show(q, (f"🗑 Delete the report of {dmy(iso)}?\nThis cannot be undone.",
+            return await show(q, (f"🗑 <b>Delete the report of {dmy(iso)}?</b>\nThis cannot be undone.",
                                   Markup([[Btn("Yes, delete", callback_data=f"h:dy:{iso}"),
                                            Btn("Cancel", callback_data=f"h:v:{iso}")]])))
         if action == "dy":                                  # delete it
             history.delete_report(iso)
-            return await show(q, history_screen(0, f"🗑 Deleted {dmy(iso)}\n\n"))
+            return await show(q, history_screen(0, f"🗑 Deleted {dmy(iso)}"))
 
     # ----- filling the report -----
     s = get_session(ctx)
@@ -423,6 +645,37 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cmd == "m:main":
         ctx.user_data.pop("waiting", None)
         await show(q, report_screen(s))
+    elif cmd == "g:start":
+        await show(q, enter_step(ctx, s, 0))
+    elif cmd in ("g:next", "g:back"):
+        g = ctx.user_data.get("guided", 0)
+        await show(q, enter_step(ctx, s, g + (1 if cmd == "g:next" else -1)))
+    elif cmd == "g:stop":
+        for k in ("guided", "waiting", "pending"):
+            ctx.user_data.pop(k, None)
+        await show(q, report_screen(s))
+    elif cmd == "review":
+        for k in ("guided", "waiting", "pending"):
+            ctx.user_data.pop(k, None)
+        await show(q, review_screen(s))
+    elif cmd == "w:ok":                                     # keep the number that looked too big
+        p = ctx.user_data.pop("pending", None)
+        if not p:
+            return await show(q, report_screen(s))
+        kind, group, key, nums = p
+        await show(q, commit_item(ctx, s, group, key, nums) if kind == "item" else commit_bar(ctx, s, nums))
+    elif cmd == "w:no":                                     # type it again
+        p = ctx.user_data.pop("pending", None)
+        g = ctx.user_data.get("guided")
+        if g is not None:
+            screen = enter_step(ctx, s, g)
+        elif p and p[0] == "item":
+            ctx.user_data["waiting"] = ("item", p[1], p[2])
+            screen = item_prompt(p[1], p[2])
+        else:
+            ctx.user_data["waiting"] = ("bar",)
+            screen = bar_prompt()
+        await show(q, screen)
     elif cmd in ("m:rooms", "m:tours"):
         ctx.user_data.pop("waiting", None)
         await show(q, group_screen(s, cmd.split(":")[1]))
@@ -443,11 +696,11 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         note = ""
         if data["expenses"]:
             gone = data["expenses"].pop()
-            note = f"↩️ Removed {gone['name']}: {gone['amount']:g}"
+            note = f"↩️ Removed {gone['name']}: {n(gone['amount'])}"
         ctx.user_data["waiting"] = ("expense",)
-        await show(q, expense_screen(s, note))
+        await show(q, expense_view(ctx, s, note))
     elif cmd == "act:reset":
-        await show(q, ("🗑 Clear all numbers of this report?\n(History is not changed.)",
+        await show(q, ("🗑 <b>Clear all numbers of this report?</b>\n(History is not changed.)",
                        Markup([[Btn("Yes, clear", callback_data="act:resety"),
                                 Btn("No", callback_data="m:main")]])))
     elif cmd == "act:resety":
@@ -458,6 +711,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             history.save_report(s["date"], data)            # saved in History (replaces the same day)
             s["saved"] = True
+            for k in ("guided", "waiting", "pending"):
+                ctx.user_data.pop(k, None)
             await deliver_file(ctx, data, s["date"], done_screen(s), q.message.message_id)
             await q.answer("✅ Saved to history")
         except Exception:
@@ -468,6 +723,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- typed messages ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    if text.strip() in SHORTCUT_TEXTS:                      # the two buttons at the bottom
+        return await (today_cmd if text.strip() == "📝 Today" else history_cmd)(update, ctx)
     w = ctx.user_data.get("waiting")
     clear_files_later(ctx)
 
@@ -484,7 +741,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(ctx)
     data = s["data"]
 
-    if w is None:  # no item chosen: still understands the one-message format
+    if w is None:  # nothing chosen: still understands the one-message format
         parsed, unknown = parse_rules(text)
         for g in ("rooms", "tours"):
             data[g].update(parsed[g])
@@ -504,32 +761,36 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         nums = numbers(text)
         if not nums:
             return await respond(update, ctx, item_prompt(group, key, "⚠️ Please type numbers."))
-        data[group][key] = three(nums)
-        ctx.user_data.pop("waiting")
-        await respond(update, ctx, group_screen(s, group, f"✅ {LABELS[group][key]} saved: {fmt(nums)}"))
+        nums = three(nums)
+        cap = unusual(s, nums, "item", group, key)
+        if cap:
+            ctx.user_data["pending"] = ("item", group, key, nums)
+            return await respond(update, ctx, warn_screen(LABELS[group][key], nums, cap))
+        await respond(update, ctx, commit_item(ctx, s, group, key, nums))
 
     elif w[0] == "bar":
         nums = numbers(text)
         if not nums:
             return await respond(update, ctx, bar_prompt("⚠️ Please type numbers."))
-        data["bar"] = three(nums)
-        ctx.user_data.pop("waiting")
-        await respond(update, ctx, report_screen(s, f"✅ Bar saved: {fmt(nums)}"))
+        nums = three(nums)
+        cap = unusual(s, nums, "bar")
+        if cap:
+            ctx.user_data["pending"] = ("bar", None, None, nums)
+            return await respond(update, ctx, warn_screen("Bar", nums, cap))
+        await respond(update, ctx, commit_bar(ctx, s, nums))
 
     elif w[0] == "discount":
         _, nums, rest = split_item(text)
         if not nums:
             return await respond(update, ctx, discount_prompt("⚠️ Please type the amount first."))
-        data["discount"] = {"amount": nums[0], "reason": " ".join(rest)}
-        ctx.user_data.pop("waiting")
-        await respond(update, ctx, report_screen(s, f"✅ Discount saved: {nums[0]:g} {' '.join(rest)}".strip()))
+        await respond(update, ctx, commit_discount(ctx, s, nums[0], " ".join(rest)))
 
     elif w[0] == "expense":
         words, nums, _ = split_item(text)
         if not words or not nums:
-            return await respond(update, ctx, expense_screen(s, "⚠️ Type the name, then the amount. Example: water 12"))
+            return await respond(update, ctx, expense_view(ctx, s, "⚠️ Type the name, then the amount. Example: water 12"))
         data["expenses"].append({"name": " ".join(words), "amount": nums[0]})
-        await respond(update, ctx, expense_screen(s, f"✅ Added {' '.join(words)}: {nums[0]:g}"))
+        await respond(update, ctx, expense_view(ctx, s, f"✅ Added {' '.join(words)}: {n(nums[0])}"))
 
 
 # ---------- evening reminder ----------
@@ -544,6 +805,15 @@ async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
     msg = await ctx.bot.send_message(OWNER, f"⏰ It is {at} - time to make today's hostel report.\n\n" + text,
                                      reply_markup=markup)
     ud["panel"] = msg.message_id
+
+
+async def post_init(app: Application):
+    """The blue "Menu" button next to the typing box."""
+    await app.bot.set_my_commands([
+        BotCommand("start", "🏠 Home"),
+        BotCommand("today", "📝 Today's report"),
+        BotCommand("history", "📚 History"),
+    ])
 
 
 def make_request():
@@ -588,15 +858,20 @@ def start_health_server():
 def main():
     start_health_server()
     app = (Application.builder().token(TOKEN)
+           .defaults(Defaults(parse_mode=ParseMode.HTML))
+           .post_init(post_init)
            .request(make_request()).get_updates_request(make_request())
            .persistence(PicklePersistence(filepath=str(history.DATA_DIR / "bot_data.pickle")))
            .concurrent_updates(True)   # a slow click does not make the next click wait
            .build())
     only_me = filters.Chat(chat_id=OWNER)
     app.add_handler(CommandHandler(["start", "menu"], home_cmd, filters=only_me))
+    app.add_handler(CommandHandler("today", today_cmd, filters=only_me))
+    app.add_handler(CommandHandler("history", history_cmd, filters=only_me))
+    app.add_handler(CommandHandler("keyboard", keyboard_cmd, filters=only_me))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
-    app.job_queue.run_daily(reminder, time=reminder_time(), user_id=OWNER, chat_id=OWNER)  # 20:00 Cambodia time
+    app.job_queue.run_daily(reminder, time=reminder_time(), user_id=OWNER, chat_id=OWNER)
     print(f"Bot is running. Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
     app.run_polling()
 

@@ -26,6 +26,17 @@ OWNER = int(os.environ["TELEGRAM_CHAT_ID"])  # only you can use the bot
 TZ = ZoneInfo("Asia/Phnom_Penh")
 PAGE = 8  # reports per page in History
 
+
+def reminder_time():
+    """Daily reminder time, Cambodia time. Default 21:30. Change it with REMINDER_TIME=HH:MM (24-hour)."""
+    raw = os.getenv("REMINDER_TIME", "21:30")
+    try:
+        hour, minute = (int(x) for x in raw.split(":"))
+        return time(hour, minute, tzinfo=TZ)
+    except ValueError:
+        logging.warning("REMINDER_TIME %r is not HH:MM, using 21:30", raw)
+        return time(21, 30, tzinfo=TZ)
+
 LABELS = {
     "rooms": {"pool": "Pool view", "city": "City view", "double_twin": "Double/Twin",
               "pod": "Pod", "dorm4": "4-bed dorm", "dorm6": "6-bed dorm"},
@@ -524,10 +535,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- evening reminder ----------
 async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data if ctx.user_data is not None else {}
+    if history.load_report(today_iso()) is not None:      # today's report is already made: no need to bother you
+        return
     old = ud.get("panel")
     background(delete_messages(ctx, ud.pop("files", []) + ([old] if old else [])))
     text, markup = home_screen()
-    msg = await ctx.bot.send_message(OWNER, "⏰ Time for today's hostel report.\n\n" + text, reply_markup=markup)
+    at = reminder_time().strftime("%I:%M %p").lstrip("0")
+    msg = await ctx.bot.send_message(OWNER, f"⏰ It is {at} - time to make today's hostel report.\n\n" + text,
+                                     reply_markup=markup)
     ud["panel"] = msg.message_id
 
 
@@ -581,8 +596,8 @@ def main():
     app.add_handler(CommandHandler(["start", "menu"], home_cmd, filters=only_me))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
-    app.job_queue.run_daily(reminder, time=time(20, 0, tzinfo=TZ), user_id=OWNER, chat_id=OWNER)  # 20:00 Cambodia time
-    print("Bot is running")
+    app.job_queue.run_daily(reminder, time=reminder_time(), user_id=OWNER, chat_id=OWNER)  # 20:00 Cambodia time
+    print(f"Bot is running. Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
     app.run_polling()
 
 

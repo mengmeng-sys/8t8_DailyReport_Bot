@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, Defaults,
                           MessageHandler, PicklePersistence, filters)
 from telegram.request import HTTPXRequest
@@ -146,7 +146,7 @@ def start_session(ctx, iso, explicit=False):
         "date": iso, "explicit": explicit, "saved": saved is not None,
         "data": complete(copy.deepcopy(saved)) if saved else fresh(),
     }
-    for k in ("waiting", "guided", "pending"):
+    for k in ("waiting", "guided", "pending", "pad"):
         ctx.user_data.pop(k, None)
     return ctx.user_data["session"]
 
@@ -256,15 +256,6 @@ def prompt_screen(title, example, back, note="", extra=""):
     return text, Markup([[Btn("⬅️ Back", callback_data=back)]])
 
 
-def item_prompt(group, key, note=""):
-    return prompt_screen(LABELS[group][key], "40 0 20", f"m:{group}", note,
-                         "3 numbers: cash card aba\n(one number = cash only, 0 = clear)\n")
-
-
-def bar_prompt(note=""):
-    return prompt_screen("🍽 Bar / Restaurant", "50 10 5", "m:main", note, "3 numbers: cash card aba\n")
-
-
 def discount_prompt(note=""):
     return prompt_screen("🏷 Discount", "5 long stay", "m:main", note, "The amount, then the reason\n")
 
@@ -286,29 +277,16 @@ def expense_screen(s, note=""):
 def step_screen(s, idx, note=""):
     step, data = STEPS[idx], s["data"]
     lines = ([esc(note), ""] if note else []) + [f"<b>STEP {idx + 1} of {len(STEPS)}</b> · {dmy(s['date'])}", ""]
-    if step[0] == "item":
-        _, group, key = step
-        cur = data[group].get(key)
-        lines += [f"<b>{TITLES[group]} › {LABELS[group][key]}</b>", "Type 3 numbers: cash card aba",
-                  "Example: <code>40 0 20</code>"]
-        now = short(cur) if cur and sum(three(cur)) else None
-    elif step[0] == "bar":
-        cur = data["bar"]
-        lines += ["<b>🍽 Bar / Restaurant</b>", "Type 3 numbers: cash card aba", "Example: <code>50 10 5</code>"]
-        now = short(cur) if sum(three(cur)) else None
-    elif step[0] == "discount":
+    if step[0] == "discount":
         d = data["discount"]
         lines += ["<b>🏷 Discount</b> (optional)", "Type the amount, then the reason",
                   "Example: <code>5 long stay</code>"]
-        now = f"{n(d['amount'])} {esc(d.get('reason', ''))}".strip() if d.get("amount") else None
+        if d.get("amount"):
+            lines += ["", f"Now: {n(d['amount'])} {esc(d.get('reason', ''))}".strip()]
+        lines += ["", "Nothing today? Tap Skip."]
     else:  # expense
         lines += ["<b>💸 Expenses</b> (optional)", ""] + expense_lines(s) + [
             "", "Type each one: name then amount", "Example: <code>water 12</code>", "Tap Done when finished."]
-        now = None
-    if now:
-        lines += ["", f"Now: {now}"]
-    if step[0] != "expense":
-        lines += ["", "Nothing today? Tap Skip."]
     nav = []
     if step[0] == "expense":
         if data["expenses"]:
@@ -321,6 +299,88 @@ def step_screen(s, idx, note=""):
     return "\n".join(lines), Markup([nav, [Btn("☰ Menu", callback_data="g:stop")]])
 
 
+# ---------- the number keypad (for a room, a tour or the bar: cash / card / aba) ----------
+def fmt_input(x):
+    x = float(x)
+    if x == 0:
+        return ""
+    return str(int(x)) if x == int(x) else f"{x:g}"
+
+
+def val(v):
+    try:
+        return float(v)
+    except ValueError:
+        return 0.0
+
+
+def init_pad(s, step, nums=None):
+    """Start the keypad. It shows the saved numbers (or the numbers you typed before a warning).
+    On saved numbers, the first digit you tap replaces the number; the numbers you typed before
+    a warning are kept, so you can fix them with the delete key."""
+    keep = nums is not None
+    if nums is None:
+        cur = s["data"][step[1]].get(step[2]) if step[0] == "item" else s["data"]["bar"]
+        nums = cur if cur and sum(three(cur)) else None
+    return {"vals": [fmt_input(x) for x in three(nums)] if nums else ["", "", ""], "field": 0,
+            "fresh": [not keep] * 3}
+
+
+def pad_screen(ctx, s, note=""):
+    w, pad = ctx.user_data["waiting"], ctx.user_data["pad"]
+    title = f"{TITLES[w[1]]} › {LABELS[w[1]][w[2]]}" if w[0] == "item" else "🍽 Bar / Restaurant"
+    shown = [v or "0" for v in pad["vals"]]
+    cells = [f"[{v}]" if i == pad["field"] else v for i, v in enumerate(shown)]
+    g = ctx.user_data.get("guided")
+    lines = ([esc(note), ""] if note else [])
+    if g is not None:
+        lines.append(f"<b>STEP {g + 1} of {len(STEPS)}</b> · {dmy(s['date'])}")
+    lines += [f"<b>{title}</b>", "",
+              f"<pre>{'CASH':>9}{'CARD':>9}{'ABA':>9}\n{cells[0]:>9}{cells[1]:>9}{cells[2]:>9}</pre>",
+              f"Total: <b>{n(sum(val(v) for v in pad['vals']))}</b>", "",
+              "Pick Cash, Card or ABA, tap the numbers, then ✅ Save.",
+              "Or type it: <code>40 0 20</code>"]
+    f = pad["field"]
+    names = ["💵 Cash", "💳 Card", "🏦 ABA"]
+    rows = [[Btn(("▸ " if i == f else "") + names[i], callback_data=f"k:f{i}") for i in range(3)]]
+    for r in (("7", "8", "9"), ("4", "5", "6"), ("1", "2", "3")):
+        rows.append([Btn(d, callback_data=f"k:{d}") for d in r])
+    rows.append([Btn("0", callback_data="k:0"), Btn(".", callback_data="k:."), Btn("⌫", callback_data="k:b")])
+    rows.append([Btn("🧹 Clear", callback_data="k:c"), Btn("Next field ➡️", callback_data="k:n")])
+    rows.append([Btn("✅ Save", callback_data="k:s")])
+    if g is not None:
+        rows.append([Btn("⏭ Skip", callback_data="g:next")] + ([Btn("⬅️ Back", callback_data="g:back")] if g > 0 else [])
+                    + [Btn("☰ Menu", callback_data="g:stop")])
+    else:
+        rows.append([Btn("⬅️ Back", callback_data=f"m:{w[1]}" if w[0] == "item" else "m:main")])
+    return "\n".join(lines), Markup(rows)
+
+
+def press_key(pad, key):
+    """One tap on the keypad."""
+    v, f = pad["vals"], pad["field"]
+    fresh = pad.setdefault("fresh", [False] * 3)
+    if (key.isdigit() or key == ".") and fresh[f]:       # first digit on a saved number: start new
+        v[f] = ""
+    if key not in ("n",) and not key.startswith("f"):
+        fresh[f] = False
+    if key.isdigit():
+        cur = "" if v[f] == "0" else v[f]
+        if len(cur.replace(".", "")) < 9:
+            v[f] = cur + key
+    elif key == ".":
+        if "." not in v[f]:
+            v[f] = (v[f] or "0") + "."
+    elif key == "b":
+        v[f] = v[f][:-1]
+    elif key == "c":
+        v[f] = ""
+    elif key == "n":
+        pad["field"] = (f + 1) % 3
+    elif key.startswith("f") and key[1:].isdigit() and int(key[1:]) < 3:
+        pad["field"] = int(key[1:])
+
+
 def enter_step(ctx, s, idx, note=""):
     """Go to a step of the guided entry (after the last step: the review)."""
     if idx >= len(STEPS):
@@ -330,6 +390,10 @@ def enter_step(ctx, s, idx, note=""):
     idx = max(0, idx)
     ctx.user_data["guided"] = idx
     ctx.user_data["waiting"] = STEPS[idx]
+    if STEPS[idx][0] in ("item", "bar"):
+        ctx.user_data["pad"] = init_pad(s, STEPS[idx])
+        return pad_screen(ctx, s, note)
+    ctx.user_data.pop("pad", None)
     return step_screen(s, idx, note)
 
 
@@ -422,9 +486,27 @@ def unusual(s, nums, kind, group=None, key=None):
     return None
 
 
+def submit_numbers(ctx, s, nums):
+    """Save the numbers for the item or bar being filled (asks first if a number looks too big)."""
+    w, nums = ctx.user_data["waiting"], three(nums)
+    if w[0] == "item":
+        _, group, key = w
+        cap = unusual(s, nums, "item", group, key)
+        if cap:
+            ctx.user_data["pending"] = ("item", group, key, nums)
+            return warn_screen(LABELS[group][key], nums, cap)
+        return commit_item(ctx, s, group, key, nums)
+    cap = unusual(s, nums, "bar")
+    if cap:
+        ctx.user_data["pending"] = ("bar", None, None, nums)
+        return warn_screen("Bar", nums, cap)
+    return commit_bar(ctx, s, nums)
+
+
 def commit_item(ctx, s, group, key, nums):
     s["data"][group][key] = three(nums)
     ctx.user_data.pop("pending", None)
+    ctx.user_data.pop("pad", None)
     note = f"✅ {LABELS[group][key]} saved: {fmt(nums)}"
     g = ctx.user_data.get("guided")
     if g is not None:
@@ -436,6 +518,7 @@ def commit_item(ctx, s, group, key, nums):
 def commit_bar(ctx, s, nums):
     s["data"]["bar"] = three(nums)
     ctx.user_data.pop("pending", None)
+    ctx.user_data.pop("pad", None)
     note = f"✅ Bar saved: {fmt(nums)}"
     g = ctx.user_data.get("guided")
     if g is not None:
@@ -455,10 +538,16 @@ def commit_discount(ctx, s, amount, reason):
 
 
 # ---------- sending screens (one panel message that is edited) ----------
-async def show(q, screen):
+async def show(q, screen, _retry=True):
     """Button tap: edit the message that was tapped."""
     try:
         await q.edit_message_text(screen[0], reply_markup=screen[1])
+    except RetryAfter as e:      # Telegram: "too many edits, wait a moment"
+        wait = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else e.retry_after
+        logging.warning("Telegram asked to wait %ss", wait)
+        if _retry:
+            await asyncio.sleep(min(float(wait), 10) + 0.5)
+            await show(q, screen, _retry=False)
     except BadRequest as e:  # "message is not modified" is fine
         if "not modified" not in str(e).lower():
             logging.exception("could not show screen")
@@ -491,6 +580,12 @@ async def respond(update, ctx, screen):
 
 
 _TASKS = set()
+_LOCKS = {}
+
+
+def pad_lock():
+    """Keypad taps are drawn one at a time, always showing the NEWEST numbers."""
+    return _LOCKS.setdefault(asyncio.get_running_loop(), asyncio.Lock())
 
 
 def background(coro):
@@ -551,7 +646,7 @@ async def deliver_file(ctx, data, iso, screen, old_panel_id):
 
 # ---------- commands and shortcuts: each opens a FRESH menu at the bottom ----------
 async def open_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, screen):
-    for k in ("waiting", "guided", "pending"):
+    for k in ("waiting", "guided", "pending", "pad"):
         ctx.user_data.pop(k, None)
     old = ctx.user_data.get("panel")
     background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
@@ -594,16 +689,16 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     cmd = q.data
     current = ctx.user_data.get("panel")
-    if current and q.message.message_id != current:        # an old menu higher up in the chat
+    if current and q.message.message_id < current:         # an OLDER menu higher up in the chat
         answer_later(q, "Old menu removed. Please use the last message.")
         return background(delete_messages(ctx, [q.message.message_id]))
     ctx.user_data["panel"] = q.message.message_id
-    if cmd != "act:generate":
+    if cmd != "act:generate" and not cmd.startswith("k:"):   # these answer later, with their own message
         answer_later(q, "Sending file..." if cmd.startswith("h:f:") else None)
     if cmd != "act:generate" and not cmd.startswith("h:f:"):
         clear_files_later(ctx)                              # new task: the old file leaves the chat
-    if not cmd.startswith(("g:", "w:", "exp:")) and cmd not in ("act:generate", "review"):
-        for k in ("guided", "pending"):                     # leaving step-by-step / a warning
+    if not cmd.startswith(("g:", "w:", "exp:", "k:")) and cmd not in ("act:generate", "review"):
+        for k in ("guided", "pending", "pad"):                     # leaving step-by-step / a warning
             ctx.user_data.pop(k, None)
 
     # ----- home and history -----
@@ -651,11 +746,11 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         g = ctx.user_data.get("guided", 0)
         await show(q, enter_step(ctx, s, g + (1 if cmd == "g:next" else -1)))
     elif cmd == "g:stop":
-        for k in ("guided", "waiting", "pending"):
+        for k in ("guided", "waiting", "pending", "pad"):
             ctx.user_data.pop(k, None)
         await show(q, report_screen(s))
     elif cmd == "review":
-        for k in ("guided", "waiting", "pending"):
+        for k in ("guided", "waiting", "pending", "pad"):
             ctx.user_data.pop(k, None)
         await show(q, review_screen(s))
     elif cmd == "w:ok":                                     # keep the number that looked too big
@@ -664,28 +759,46 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await show(q, report_screen(s))
         kind, group, key, nums = p
         await show(q, commit_item(ctx, s, group, key, nums) if kind == "item" else commit_bar(ctx, s, nums))
-    elif cmd == "w:no":                                     # type it again
+    elif cmd == "w:no":                                     # change it: the keypad keeps what you typed
         p = ctx.user_data.pop("pending", None)
-        g = ctx.user_data.get("guided")
-        if g is not None:
-            screen = enter_step(ctx, s, g)
-        elif p and p[0] == "item":
-            ctx.user_data["waiting"] = ("item", p[1], p[2])
-            screen = item_prompt(p[1], p[2])
+        if p:
+            ctx.user_data["waiting"] = ("item", p[1], p[2]) if p[0] == "item" else ("bar",)
+            ctx.user_data["pad"] = init_pad(s, ctx.user_data["waiting"], p[3])
+            await show(q, pad_screen(ctx, s))
         else:
-            ctx.user_data["waiting"] = ("bar",)
-            screen = bar_prompt()
-        await show(q, screen)
+            await show(q, report_screen(s))
+    elif cmd.startswith("k:"):                              # a key on the keypad
+        w, pad = ctx.user_data.get("waiting"), ctx.user_data.get("pad")
+        if not pad or not w or w[0] not in ("item", "bar"):   # e.g. a double tap after Save: do nothing
+            answer_later(q, "That keypad is closed.")
+            if "Pick Cash, Card or ABA" in (q.message.text or ""):   # an old keypad still on screen
+                await show(q, report_screen(s, "That keypad is closed. Choose an item again."))
+            return
+        answer_later(q)
+        if cmd == "k:s":
+            screen = submit_numbers(ctx, s, [val(v) for v in pad["vals"]])
+            async with pad_lock():                            # wait until earlier keypad drawings are done
+                await show(q, screen)
+        else:
+            press_key(pad, cmd[2:])                         # the numbers change at once, in tap order
+            pad["v"] = pad.get("v", 0) + 1
+            async with pad_lock():
+                still_open = ctx.user_data.get("pad") is pad and ctx.user_data.get("waiting")
+                if still_open and pad.get("shown") != pad["v"]:   # a later tap may have drawn it already
+                    pad["shown"] = pad["v"]
+                    await show(q, pad_screen(ctx, s))
     elif cmd in ("m:rooms", "m:tours"):
         ctx.user_data.pop("waiting", None)
         await show(q, group_screen(s, cmd.split(":")[1]))
     elif cmd.startswith("in:rooms:") or cmd.startswith("in:tours:"):
         _, group, key = cmd.split(":")
         ctx.user_data["waiting"] = ("item", group, key)
-        await show(q, item_prompt(group, key))
+        ctx.user_data["pad"] = init_pad(s, ctx.user_data["waiting"])
+        await show(q, pad_screen(ctx, s))
     elif cmd == "in:bar":
         ctx.user_data["waiting"] = ("bar",)
-        await show(q, bar_prompt())
+        ctx.user_data["pad"] = init_pad(s, ctx.user_data["waiting"])
+        await show(q, pad_screen(ctx, s))
     elif cmd == "in:discount":
         ctx.user_data["waiting"] = ("discount",)
         await show(q, discount_prompt())
@@ -711,7 +824,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             history.save_report(s["date"], data)            # saved in History (replaces the same day)
             s["saved"] = True
-            for k in ("guided", "waiting", "pending"):
+            for k in ("guided", "waiting", "pending", "pad"):
                 ctx.user_data.pop(k, None)
             await deliver_file(ctx, data, s["date"], done_screen(s), q.message.message_id)
             await q.answer("✅ Saved to history")
@@ -756,28 +869,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             note += "\nNot understood: " + "; ".join(unknown)
         await respond(update, ctx, report_screen(s, note))
 
-    elif w[0] == "item":
-        _, group, key = w
+    elif w[0] in ("item", "bar"):
         nums = numbers(text)
         if not nums:
-            return await respond(update, ctx, item_prompt(group, key, "⚠️ Please type numbers."))
-        nums = three(nums)
-        cap = unusual(s, nums, "item", group, key)
-        if cap:
-            ctx.user_data["pending"] = ("item", group, key, nums)
-            return await respond(update, ctx, warn_screen(LABELS[group][key], nums, cap))
-        await respond(update, ctx, commit_item(ctx, s, group, key, nums))
-
-    elif w[0] == "bar":
-        nums = numbers(text)
-        if not nums:
-            return await respond(update, ctx, bar_prompt("⚠️ Please type numbers."))
-        nums = three(nums)
-        cap = unusual(s, nums, "bar")
-        if cap:
-            ctx.user_data["pending"] = ("bar", None, None, nums)
-            return await respond(update, ctx, warn_screen("Bar", nums, cap))
-        await respond(update, ctx, commit_bar(ctx, s, nums))
+            if "pad" not in ctx.user_data:
+                ctx.user_data["pad"] = init_pad(s, w)
+            return await respond(update, ctx, pad_screen(ctx, s, "⚠️ Please type numbers, or use the keypad."))
+        await respond(update, ctx, submit_numbers(ctx, s, nums))
 
     elif w[0] == "discount":
         _, nums, rest = split_item(text)
@@ -808,12 +906,15 @@ async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    """The blue "Menu" button next to the typing box."""
-    await app.bot.set_my_commands([
-        BotCommand("start", "🏠 Home"),
-        BotCommand("today", "📝 Today's report"),
-        BotCommand("history", "📚 History"),
-    ])
+    """The blue "Menu" button next to the typing box. If Telegram is slow now, the bot still starts."""
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "🏠 Home"),
+            BotCommand("today", "📝 Today's report"),
+            BotCommand("history", "📚 History"),
+        ])
+    except Exception as e:
+        logging.warning("Could not set the Menu button now (%s). The bot works anyway.", e)
 
 
 def make_request():
@@ -822,8 +923,8 @@ def make_request():
     kwargs = {}
     if os.getenv("FORCE_IPV4", "1") == "1":
         kwargs["httpx_kwargs"] = {"transport": httpx.AsyncHTTPTransport(local_address="0.0.0.0")}
-    return HTTPXRequest(connection_pool_size=16, connect_timeout=10, read_timeout=15,
-                        write_timeout=15, **kwargs)
+    return HTTPXRequest(connection_pool_size=16, connect_timeout=20, read_timeout=30,
+                        write_timeout=30, pool_timeout=10, **kwargs)
 
 
 def start_health_server():
@@ -873,7 +974,7 @@ def main():
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_daily(reminder, time=reminder_time(), user_id=OWNER, chat_id=OWNER)
     print(f"Bot is running. Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
-    app.run_polling()
+    app.run_polling(bootstrap_retries=-1)   # if Telegram cannot be reached at start, keep trying
 
 
 if __name__ == "__main__":

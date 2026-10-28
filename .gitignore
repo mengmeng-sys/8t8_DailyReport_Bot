@@ -1,7 +1,6 @@
-
 .env
 __pycache__
 venv
 bot_data.pickle
 history/
- 
+bot.log

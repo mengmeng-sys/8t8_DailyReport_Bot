@@ -4,3 +4,4 @@ venv
 bot_data.pickle
 history/
 bot.log
+models/

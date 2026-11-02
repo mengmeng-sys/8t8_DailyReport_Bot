@@ -4,3 +4,4 @@ lxml
 python-dotenv
 tzdata
 faster-whisper
+av<19

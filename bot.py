@@ -664,12 +664,12 @@ def storage_screen(page, note=""):
     return ((esc(note) + "\n\n" if note else "") + f"<b>🗂 Storage</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
 
 
-def import_body(data, date_label):
+def import_body(data, date_label, title="📥 IMPORT"):
     """The same aligned table as a report, for an imported file."""
     sm = summarize(data)
     empty = not any(sum(three(v)) for g in ("rooms", "tours") for v in data[g].values()) \
         and not sum(three(data["bar"]))
-    parts = [f"<b>📥 IMPORT</b> · {date_label}", ""]
+    parts = [f"<b>{title}</b> · {date_label}", ""]
     if empty:
         parts += ["<i>Nothing filled in the file.</i>"]
     else:
@@ -683,26 +683,44 @@ def import_body(data, date_label):
     return "\n".join(parts)
 
 
+def next_missing_date(ctx):
+    """Ask for the date of the first file that has none. Returns True if one is asked for."""
+    imports = ctx.user_data.get("imports") or []
+    for i, imp in enumerate(imports):
+        if not imp["date"]:
+            ctx.user_data["waiting"] = ("importdate", i)
+            return True
+    ctx.user_data.pop("waiting", None)
+    return False
+
+
 def import_screen(ctx, note=""):
-    imp = ctx.user_data.get("import")
-    if not imp:
+    """A batch of imported files: send several at once, then Save all."""
+    imports = ctx.user_data.get("imports") or []
+    if not imports:
         return home_screen()
-    if imp["date"]:
-        text = import_body(imp["data"], dmy(imp["date"]))
-        if history.load_report(imp["date"]) is not None:
-            text += f"\n\n⚠️ A report for {dmy(imp['date'])} is already saved in History."
-            btns = [[Btn("🔁 Replace", callback_data="imp:replace"), Btn("❌ Cancel", callback_data="imp:cancel")]]
+    noun = "file" if len(imports) == 1 else "files"
+    lines = [f"<b>📥 IMPORT</b> ({len(imports)} {noun})", ""]
+    existing = []
+    for i, imp in enumerate(imports, 1):
+        title = "📥 IMPORT" if len(imports) == 1 else f"File {i}"
+        if imp["date"]:
+            lines.append(import_body(imp["data"], dmy(imp["date"]), title))
+            if history.load_report(imp["date"]) is not None:
+                existing.append(imp["date"])
         else:
-            text += "\n\nSave this report?"
-            btns = [[Btn("✅ Save", callback_data="imp:save"), Btn("❌ Cancel", callback_data="imp:cancel")]]
-    else:
-        text = import_body(imp["data"], "date?") + "\n\n❓ I cannot find the date.\nType it as dd/mm/yyyy."
-        btns = [[Btn("❌ Cancel", callback_data="imp:cancel")]]
-    if imp["warnings"]:
-        text += "\n\n⚠️ " + "\n⚠️ ".join(esc(w) for w in imp["warnings"])
+            lines.append(f"<b>{esc(imp['name'])}</b> · ❓ no date - type it as dd/mm/yyyy")
+        if imp["warnings"]:
+            lines.append("⚠️ " + " · ".join(esc(w) for w in imp["warnings"]))
+        lines.append("")
+    if existing:
+        lines.append(f"⚠️ These days are already saved: {', '.join(dmy(d) for d in existing)}. They will be replaced.")
+    lines.append("Send every file, then tap Save all.")
     if note:
-        text = esc(note) + "\n\n" + text
-    return text, Markup(btns)
+        lines.insert(0, esc(note) + "\n")
+    btns = [[Btn("🔁 Replace all" if existing else "✅ Save all", callback_data="imp:save"),
+             Btn("❌ Cancel", callback_data="imp:cancel")]]
+    return "\n".join(lines), Markup(btns)
 
 
 def mark_undo(ctx, items, screen="home"):
@@ -1083,7 +1101,7 @@ async def deliver_file(ctx, data, iso, screen, old_panel_id):
 
 # ---------- commands and shortcuts: each opens a FRESH menu at the bottom ----------
 async def open_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, screen):
-    for k in ("waiting", "guided", "pending", "pad", "cash_ui", "exp_from", "import"):
+    for k in ("waiting", "guided", "pending", "pad", "cash_ui", "exp_from", "imports"):
         ctx.user_data.pop(k, None)
     old = ctx.user_data.get("panel")
     background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
@@ -1253,29 +1271,32 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             mark_undo(ctx, [("draft", iso, {"session": draft})], screen="home")
         storage.delete_draft(iso)
         return await show(q, add_undo(ctx, home_screen()))
-    if cmd in ("imp:save", "imp:replace"):
-        imp = ctx.user_data.get("import")
-        if not imp or not imp["date"]:
-            ctx.user_data.pop("import", None)
-            return await show(q, home_screen())
-        iso = imp["date"]
-        items = []
-        if cmd == "imp:replace":
+    if cmd == "imp:save":
+        imports = ctx.user_data.get("imports") or []
+        items, saved_dates = [], []
+        for imp in imports:
+            if not imp["date"]:
+                continue
+            iso = imp["date"]
             old = history.load_report(iso)
             if old:
                 items.append(("history", iso, {"data": old}))
             b64 = storage.stored_file_b64(iso)
             if b64:
                 items.append(("stored", iso, {"file_b64": b64}))
+            history.save_report(iso, imp["data"])
+            storage.store_report(iso, imp["raw"])
+            saved_dates.append(iso)
         if items:
             mark_undo(ctx, items, screen="report")
-        history.save_report(iso, imp["data"])
-        storage.store_report(iso, imp["raw"])
-        ctx.user_data.pop("import", None)
-        s = start_session(ctx, iso, explicit=True)
-        return await show(q, add_undo(ctx, report_screen(s, "✅ Imported and saved")))
+        ctx.user_data.pop("imports", None)
+        ctx.user_data.pop("waiting", None)
+        if not saved_dates:
+            return await show(q, add_undo(ctx, import_screen(ctx, "⚠️ No date given yet.")))
+        s = start_session(ctx, saved_dates[-1], explicit=True)
+        return await show(q, add_undo(ctx, report_screen(s, f"✅ Saved {len(saved_dates)} file(s)")))
     if cmd == "imp:cancel":
-        ctx.user_data.pop("import", None)
+        ctx.user_data.pop("imports", None)
         ctx.user_data.pop("waiting", None)
         return await show(q, home_screen())
 
@@ -1517,16 +1538,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await respond(update, ctx, report_screen(start_session(ctx, day.strftime("%Y-%m-%d"), explicit=True)))
 
     if w and w[0] == "importdate":                           # the date of an imported file
-        if not ctx.user_data.get("import"):
+        imports = ctx.user_data.get("imports") or []
+        i = w[1] if len(w) > 1 else 0
+        if not imports or not 0 <= i < len(imports):
             ctx.user_data.pop("waiting", None)
-            return await respond(update, ctx, home_screen())
+            return await respond(update, ctx, import_screen(ctx))
         m = re.search(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", text)
         try:
             day = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
         except (AttributeError, ValueError):
             return await respond(update, ctx, import_screen(ctx, "⚠️ I cannot read that date."))
-        ctx.user_data["import"]["date"] = day.strftime("%Y-%m-%d")
-        ctx.user_data.pop("waiting", None)
+        imports[i]["date"] = day.strftime("%Y-%m-%d")
+        next_missing_date(ctx)
         return await respond(update, ctx, import_screen(ctx))
 
     s = get_session(ctx)
@@ -1735,9 +1758,9 @@ async def import_document(update, ctx, doc):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    ctx.user_data["import"] = {"date": d, "data": data, "warnings": warnings, "raw": raw, "name": doc.file_name}
-    if not d:
-        ctx.user_data["waiting"] = ("importdate",)
+    ctx.user_data.setdefault("imports", []).append(
+        {"date": d, "data": data, "warnings": warnings, "raw": raw, "name": doc.file_name})
+    next_missing_date(ctx)                           # ask for a date only if one is missing
     await refresh(ctx, import_screen(ctx))
 
 

@@ -28,7 +28,10 @@ Undo puts the data back. Trash copies are removed after 7 days.
 
 ## 3. Storage (read a report you send)
 
-- Send the bot an `.xlsx` report file (any time). The bot:
+- Send the bot an `.xlsx` report file (any time). You can send **several files
+  one after another**; the bot keeps them in a batch and the screen updates to
+  show them all. Tap **✅ Save all** when you have sent every file.
+- For each file the bot:
   1. Reads it (openpyxl, `data_only=True`, nothing is executed).
   2. Shows a preview (same aligned table as a report, plus revenue, expenses and
      the date).
@@ -36,9 +39,9 @@ Undo puts the data back. Trash copies are removed after 7 days.
      (`dd-mm-yyyy`); if still missing, asks you to type the date.
   4. Recomputes the totals from the cells and compares them with the cached
      totals in the file (C27 revenue, B44 expenses). If they differ, it warns.
-  5. Asks **✅ Save** (or **🔁 Replace** if the day already exists).
-- On Save it writes the day to History **and** keeps the original file in
-  `DATA_DIR/storage/reports/YYYY-MM-DD.xlsx`.
+  5. When you tap **Save all**, writes every day to History **and** keeps the
+     original files in `DATA_DIR/storage/reports/YYYY-MM-DD.xlsx`. Days that
+     already exist are replaced (the old version goes to trash, with Undo).
 - The **🗂 Storage** screen (on Home and in History) lists the stored files.
   Tap one for **👁 Open (preview)**, **📥 Send file** and **🗑 Delete**.
 
@@ -75,9 +78,11 @@ stored files, and **never** overwrites a day or a file that already exists.
    numbers are gone and an **↩️ Undo** button appears. Tap it: the numbers come
    back.
 3. **Read a report.** Make a report and confirm it, then send that `.xlsx` file
-   back to the bot. It shows a preview; tap **✅ Save**. Open **🗂 Storage**:
-   the file is listed. Tap it to see the preview, **📥 Send file**, and
-   **🗑 Delete** (asks first).
+   back to the bot. It shows a preview; tap **✅ Save all**. To read several
+   reports, send 3 or 4 files one after another: the screen shows "3 files" and
+   grows as you send; then tap **✅ Save all**. Open **🗂 Storage**: the files
+   are listed. Tap one to see the preview, **📥 Send file**, and **🗑 Delete**
+   (asks first).
 4. **Replace safely.** Send the same file again: the bot says the day already
    exists and offers **🔁 Replace**. Tap it, then **↩️ Undo** to get the old one
    back.

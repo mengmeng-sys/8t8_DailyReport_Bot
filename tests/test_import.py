@@ -96,7 +96,7 @@ def test_f_existing_day_asks_and_trashes(harness, tmp_path):
         text = h.last_text()
         assert "already saved" in text, text
         assert h.has_button("Replace"), h.button_texts()
-        await h.tap("imp:replace")
+        await h.tap("imp:save")
         assert history.load_report("2026-10-20")["bar"] == [50.0, 10.0, 5.0]
         # the old version was kept in trash
         trash = list(storage._dir("trash").glob("*.json"))
@@ -129,11 +129,11 @@ def test_f_missing_date_asks(harness, tmp_path):
         await h.msg("/start")
         await send_file(h, path)
         text = h.last_text()
-        assert "cannot find the date" in text, text
+        assert "no date" in text, text
         await h.msg("20/10/2026")
         text = h.last_text()
         assert "IMPORT" in text and "20/10/2026" in text, text
-        assert h.has_button("Save"), h.button_texts()
+        assert h.has_button("Save all"), h.button_texts()
         await h.tap("imp:save")
         assert history.load_report("2026-10-20") is not None
         await h.stop()
@@ -150,6 +150,32 @@ def test_f_wrong_date_uses_cell(harness, tmp_path):
         await send_file(h, path)
         text = h.last_text()
         assert "20/10/2026" in text, text
+        await h.stop()
+
+    run(scenario(harness))
+
+
+def test_f_multiple_files_at_once(harness, tmp_path):
+    async def scenario(h):
+        days = [("2026-10-18", [10, 0, 0]), ("2026-10-19", [20, 0, 0]), ("2026-10-20", [30, 0, 0])]
+        paths = []
+        for iso, pool in days:
+            p = tmp_path / f"{iso}_Report.xlsx"
+            make_report({"rooms": {"pool": pool}, "tours": {}, "bar": [], "discount": {},
+                         "expenses": [], "cash_check": {}}, p, iso)
+            paths.append(p)
+        await h.start()
+        await h.msg("/start")
+        for p in paths:                       # send them one after another, like a burst
+            await send_file(h, p)
+        text = h.last_text()
+        assert "3 files" in text, text
+        for d in ("18/10/2026", "19/10/2026", "20/10/2026"):
+            assert d in text, text
+        await h.tap("imp:save")
+        for iso, _ in days:
+            assert history.load_report(iso) is not None
+            assert storage.stored_report_path(iso).exists()
         await h.stop()
 
     run(scenario(harness))

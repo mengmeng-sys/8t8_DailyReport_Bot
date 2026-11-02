@@ -1,4 +1,11 @@
-# MANUAL.md - Storage, drafts and Undo
+# MANUAL.md - Storage, drafts, Undo and language
+
+## 0. Language (KH / EN)
+
+The bot speaks **English** and **Khmer**. Switch with the `/lang` command or the
+**🌐 Language** button on Home, then tap **🇬🇧 English** or **🇰🇭 ភាសាខ្មែរ**.
+The choice is remembered for your chat. The room and tour names (Pool view,
+Killing Field, …) stay in English because they are your business names.
 
 The bot now never loses an unfinished report, can read a report `.xlsx` you send
 it, and keeps the files you send in a **Storage** folder.

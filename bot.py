@@ -19,6 +19,7 @@ import history
 import monthly
 import storage
 import importer
+import lang
 from fill import fill_template, summarize
 from reader import parse as parse_rules, _split as split_item
 
@@ -32,6 +33,41 @@ OWNER = int(os.environ["TELEGRAM_CHAT_ID"])  # only you can use the bot
 TZ = ZoneInfo("Asia/Phnom_Penh")
 PAGE = 8  # reports per page in History
 VERSION = "2026-11-02 storage+drafts+import"   # shown in /ping and in the log, to see which file runs
+
+# ---------- language (KH / EN) ----------
+_LANG = "en"
+
+
+def set_lang(ctx):
+    """Remember the language of this chat for this update."""
+    global _LANG
+    _LANG = (ctx.user_data or {}).get("lang", "en")
+
+
+def tr(key, **fmt):
+    """A text in the current language. Falls back to English."""
+    d = lang.STRINGS.get(_LANG) or lang.STRINGS["en"]
+    text = d.get(key) or lang.STRINGS["en"].get(key) or key
+    try:
+        return text.format(**fmt) if fmt else text
+    except (KeyError, IndexError, ValueError):
+        return text
+
+
+def noun(n, one, many):
+    return tr(one) if n == 1 else tr(many)
+
+
+KHMER_MONTHS = ["មករា", "កុម្ភៈ", "មីនា", "មេសា", "ឧសភា", "មិថុនា",
+                "កក្កដា", "សីហា", "កញ្ញា", "តុលា", "វិច្ឆិកា", "ធ្នូ"]
+
+
+def month_name(m):
+    return KHMER_MONTHS[m - 1] if _LANG == "kh" else calendar.month_name[m]
+
+
+def month_abbr(m):
+    return KHMER_MONTHS[m - 1] if _LANG == "kh" else calendar.month_abbr[m]
 
 
 def reminder_time():
@@ -218,15 +254,15 @@ def trow(label, v):
 
 
 def table_block(data):
-    lines = [f"{'':<{W}}{'CASH':>7}{'CARD':>7}{'ABA':>7}"]
-    for group, title in (("rooms", "ROOMS"), ("tours", "TOURS")):
+    lines = [f"{'':<{W}}{tr('cash_hdr'):>7}{tr('card_hdr'):>7}{tr('aba_hdr'):>7}"]
+    for group, key in (("rooms", "rooms_hdr"), ("tours", "tours_hdr")):
         rows = [trow(SHORT[group][k], data[group][k]) for k in LABELS[group]
                 if data[group].get(k) and sum(three(data[group][k]))]
         if rows:
-            lines += [title] + rows
+            lines += [tr(key)] + rows
     if sum(three(data["bar"])):
-        lines += ["BAR", trow("Bar", data["bar"])]
-    lines += ["-" * (W + 21), trow("TOTAL", method_totals(data))]
+        lines += [tr("bar_hdr"), trow(tr("bar"), data["bar"])]
+    lines += ["-" * (W + 21), trow(tr("total_hdr"), method_totals(data))]
     return "\n".join(lines)
 
 
@@ -236,15 +272,18 @@ def report_body(data, iso, title):
         and not sum(three(data["bar"]))
     parts = [f"<b>{title}</b> · {dmy(iso)}", ""]
     if empty:
-        parts += ["<i>Nothing filled yet.</i>"]
+        parts += [tr("nothing_filled")]
     else:
-        parts += [f"<pre>{esc(table_block(data))}</pre>", f"💰 <b>Revenue {n(sm['total'])}</b>"]
+        parts += [f"<pre>{esc(table_block(data))}</pre>", tr("revenue", rev=n(sm['total']))]
     if d.get("amount"):
-        parts.append(f"🏷 Discount {n(d['amount'])}" + (f" · {esc(d['reason'])}" if d.get("reason") else ""))
+        line = tr("discount_line", amt=n(d['amount']))
+        if d.get("reason"):
+            line += tr("discount_reason", reason=esc(d['reason']))
+        parts.append(line)
     if data["expenses"]:
-        items = "\n".join(f"{e['name']}: {n(e['amount'])}" + ("" if e.get("cash", True) else " (not from cash drawer)")
+        items = "\n".join(f"{e['name']}: {n(e['amount'])}" + ("" if e.get("cash", True) else tr("not_from_cash"))
                           for e in data["expenses"])
-        parts += [f"💸 Expenses {n(sm['expenses'])}", f"<pre>{esc(items)}</pre>"]
+        parts += [tr("expenses_line", exp=n(sm['expenses'])), f"<pre>{esc(items)}</pre>"]
     parts += cash_lines(data)
     return "\n".join(parts)
 
@@ -257,88 +296,97 @@ def draft_banner():
     draft = storage.load_draft(today)
     if draft:
         rev = summarize(complete(draft["data"]))["total"]
-        lines.append(f"📝 <b>Draft in progress</b>: {dmy(today)} · revenue {n(rev)} (not saved yet)")
-        rows.append([Btn("▶️ Continue draft", callback_data="d:cont"), Btn("🆕 Start new", callback_data="d:new")])
+        lines.append(tr("draft_in_progress", date=dmy(today), rev=n(rev)))
+        rows.append([Btn(tr("continue_draft"), callback_data="d:cont"), Btn(tr("start_new_btn"), callback_data="d:new")])
     for d in storage.list_drafts(exclude=today):
         iso = d["date"]
-        lines.append(f"🕓 Unfinished draft from {dmy(iso)}")
-        rows.append([Btn(f"▶️ Continue {dmy(iso)[:5]}", callback_data=f"d:cont:{iso}"),
-                     Btn("🗑 Discard", callback_data=f"d:disc:{iso}")])
+        lines.append(tr("draft_older", date=dmy(iso)))
+        rows.append([Btn(tr("continue_date", date=dmy(iso)[:5]), callback_data=f"d:cont:{iso}"),
+                     Btn(tr("discard"), callback_data=f"d:disc:{iso}")])
     return lines, rows
 
 
 def home_screen():
     saved = history.load_report(today_iso()) is not None
-    text = ("<b>🏨 Hostel report</b>\n\n"
-            + ("Today's report is already saved ✅\n" if saved else "Today's report is not made yet.\n"))
+    text = (tr("home_title") + "\n\n"
+            + (tr("home_saved") + "\n" if saved else tr("home_not_made") + "\n"))
     banner, banner_rows = draft_banner()
     if banner:
         text += "\n" + "\n".join(banner)
-    text += "\n\nWhat do you want to do?"
-    start = "✏️ Update today's report" if saved else "▶️ Start today's report"
+    text += "\n\n" + tr("home_what")
+    start = tr("update_today") if saved else tr("start_new")
     rows = [[Btn(start, callback_data="new")]] + banner_rows + [
-        [Btn("📚 History", callback_data="hist:0"), Btn("📊 Month", callback_data="mon:cur")],
-        [Btn("📅 Other date", callback_data="newdate"), Btn("🗂 Storage", callback_data="stor:0")],
+        [Btn(tr("history"), callback_data="hist:0"), Btn(tr("month"), callback_data="mon:cur")],
+        [Btn(tr("other_date"), callback_data="newdate"), Btn(tr("storage"), callback_data="stor:0")],
+        [Btn(tr("language"), callback_data="lang:menu")],
     ]
     return text, Markup(rows)
 
 
+def lang_screen():
+    return (tr("lang_title") + "\n\n" + tr("lang_choose"),
+            Markup([[Btn(tr("lang_en"), callback_data="lang:en"), Btn(tr("lang_kh"), callback_data="lang:kh")]]))
+
+
 def report_screen(s, note=""):
     data, sm, d = s["data"], summarize(s["data"]), s["data"]["discount"]
-    mode = "Updating saved report" if s.get("saved") else "New report"
+    mode = tr("mode_update") if s.get("saved") else tr("mode_new")
     rooms, tours = filled(data, "rooms"), filled(data, "tours")
     rows = [
-        f"{'Rooms':<10}{dots(rooms)}  {rooms}/6",
-        f"{'Tours':<10}{dots(tours)}  {tours}/6",
-        f"{'Bar':<10}{n(sm['bar'])}" if sm["bar"] else f"{'Bar':<10}-",
-        f"{'Discount':<10}{n(d['amount'])}" if d.get("amount") else f"{'Discount':<10}-",
-        f"{'Expenses':<10}{len(data['expenses'])} item(s) · {n(sm['expenses'])}" if data["expenses"]
-        else f"{'Expenses':<10}-",
+        f"{tr('rooms'):<10}{dots(rooms)}  {rooms}/6",
+        f"{tr('tours'):<10}{dots(tours)}  {tours}/6",
+        f"{tr('bar'):<10}{n(sm['bar'])}" if sm["bar"] else f"{tr('bar'):<10}{tr('dash')}",
+        f"{tr('discount'):<10}{n(d['amount'])}" if d.get("amount") else f"{tr('discount'):<10}{tr('dash')}",
+        f"{tr('expenses'):<10}{len(data['expenses'])} {tr('items')} · {n(sm['expenses'])}" if data["expenses"]
+        else f"{tr('expenses'):<10}{tr('dash')}",
     ]
     cf = cash_figures(data)
-    rows.append(f"{'Cash':<10}" + (f"{cash_status(cf).replace('⚠️ ', '').replace('✅ ', '')}" if cf["has"] else "not counted"))
+    rows.append(f"{tr('cash'):<10}" + (f"{cash_status(cf).replace('⚠️ ', '').replace('✅ ', '')}" if cf["has"] else tr("not_counted")))
     cash, card, aba = method_totals(data)
     text = ((esc(note) + "\n\n") if note else "") + (
-        f"<b>🏨 HOSTEL REPORT</b> · {dmy(s['date'])}\n<i>{mode}</i>\n\n"
+        tr("report_title", date=dmy(s['date'])) + f"\n{mode}\n\n"
         f"<pre>{esc(chr(10).join(rows))}</pre>"
-        f"<pre>{'':<10}{'CASH':>7}{'CARD':>7}{'ABA':>7}\n{'Total':<10}{n(cash):>7}{n(card):>7}{n(aba):>7}</pre>"
-        f"💰 <b>Revenue {n(sm['total'])}</b>")
+        f"<pre>{'':<10}{tr('cash_hdr'):>7}{tr('card_hdr'):>7}{tr('aba_hdr'):>7}\n"
+        f"{tr('total_hdr'):<10}{n(cash):>7}{n(card):>7}{n(aba):>7}</pre>"
+        + tr("revenue", rev=n(sm['total'])))
     return text, Markup([
-        [Btn("▶️ Fill step by step", callback_data="g:start")],
-        [Btn("🛏 Rooms", callback_data="m:rooms"), Btn("🧳 Tours", callback_data="m:tours"),
-         Btn("🍽 Bar", callback_data="in:bar")],
-        [Btn("🏷 Discount", callback_data="in:discount"), Btn("💸 Expenses", callback_data="in:expense")],
-        [Btn("💵 Cash check", callback_data="cash:main"), Btn("📋 Review & finish", callback_data="review")],
-        [Btn("🏠 Home", callback_data="home"), Btn("🗑 Clear all", callback_data="act:reset")],
+        [Btn(tr("fill_step"), callback_data="g:start")],
+        [Btn(tr("rooms_btn"), callback_data="m:rooms"), Btn(tr("tours_btn"), callback_data="m:tours"),
+         Btn(tr("bar_btn"), callback_data="in:bar")],
+        [Btn(tr("discount_btn"), callback_data="in:discount"), Btn(tr("expenses_btn"), callback_data="in:expense")],
+        [Btn(tr("cash_btn"), callback_data="cash:main"), Btn(tr("review_btn"), callback_data="review")],
+        [Btn(tr("home_btn"), callback_data="home"), Btn(tr("clear_all"), callback_data="act:reset")],
     ])
 
 
 def group_screen(s, group, note=""):
     data = s["data"]
-    text = ((esc(note) + "\n\n") if note else "") + f"<b>{TITLES[group]}</b>\nTap one, then type its numbers."
+    text = ((esc(note) + "\n\n") if note else "") + tr("rooms_title" if group == "rooms" else "tours_title") \
+        + "\n" + tr("tap_one")
     rows = []
     for key, label in LABELS[group].items():
         vals = data[group].get(key)
-        rows.append([Btn(f"✅ {label}   {short(vals)}" if vals and sum(three(vals)) else f"▫️ {label}",
-                         callback_data=f"in:{group}:{key}")])
-    rows.append([Btn("⬅️ Back to report", callback_data="m:main")])
+        rows.append([Btn(tr("filled", label=label, vals=short(vals)) if vals and sum(three(vals))
+                         else tr("empty_item", label=label), callback_data=f"in:{group}:{key}")])
+    rows.append([Btn(tr("back_report"), callback_data="m:main")])
     return text, Markup(rows)
 
 
 def prompt_screen(title, example, back, note="", extra=""):
-    text = ((esc(note) + "\n\n") if note else "") + f"<b>{title}</b>\n\n{extra}Type it now.\nExample: <code>{example}</code>"
-    return text, Markup([[Btn("⬅️ Back", callback_data=back)]])
+    text = ((esc(note) + "\n\n") if note else "") + f"<b>{title}</b>\n\n{extra}" \
+        + tr("type_now", example=example)
+    return text, Markup([[Btn(tr("back"), callback_data=back)]])
 
 
 def discount_prompt(note=""):
-    return prompt_screen("🏷 Discount", "5 long stay", "m:main", note, "The amount, then the reason\n")
+    return prompt_screen(tr("discount_title"), tr("example_discount"), "m:main", note, tr("discount_extra"))
 
 
 def expense_lines(s):
     items = s["data"]["expenses"]
-    lines = [f"{i}. {esc(e['name'])}: {n(e['amount'])}" + ("" if e.get("cash", True) else " 🚫 not from drawer")
-             for i, e in enumerate(items, 1)] or ["<i>(none yet)</i>"]
-    return lines + ["", f"Total: <b>{n(sum(e['amount'] for e in items))}</b>"]
+    lines = [f"{i}. {esc(e['name'])}: {n(e['amount'])}" + ("" if e.get("cash", True) else tr("not_from_drawer_short"))
+             for i, e in enumerate(items, 1)] or [tr("none_yet")]
+    return lines + ["", tr("total_b", total=n(sum(e['amount'] for e in items)))]
 
 
 def name_key(name):
@@ -370,39 +418,40 @@ def last_expenses(s):
 
 def quick_expense_rows(s):
     """Buttons: your usual expenses, and 'same as the last report'."""
-    btns = [Btn(f"➕ {name[:16]} {n(amt)}", callback_data=f"exp:q:{i}:{name_key(name)}")
+    btns = [Btn(tr("quick_add", name=name[:16], amt=n(amt)), callback_data=f"exp:q:{i}:{name_key(name)}")
             for i, (name, amt) in enumerate(frequent_expenses(s))]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     iso, old = last_expenses(s)
     if iso and not s["data"]["expenses"]:
-        rows.append([Btn(f"📋 Same as {dmy(iso)[:5]} ({len(old)} item{'s' if len(old) != 1 else ''})", callback_data="exp:yday")])
+        rows.append([Btn(tr("same_as", date=dmy(iso)[:5], n=len(old),
+                            noun=noun(len(old), "report_one", "report_many")), callback_data="exp:yday")])
     return rows
 
 
 def expense_screen(s, note=""):
     items = s["data"]["expenses"]
     quick = quick_expense_rows(s)
-    lines = ([esc(note), ""] if note else []) + ["<b>💸 Expenses</b>", ""] + expense_lines(s) + [
-        "", "Type the next one: name then amount", "Example: <code>water 12</code>"]
+    lines = ([esc(note), ""] if note else []) + [tr("expenses_title"), ""] + expense_lines(s) + [
+        "", tr("type_next"), tr("example_line", example=tr("example_expense"))]
     if quick:
-        lines.append("Or tap one of your usual expenses 👇")
-    row = ([Btn("↩️ Undo last", callback_data="exp:undo"), Btn("✏️ Edit list", callback_data="exp:list:main")]
-           if items else []) + [Btn("✅ Done", callback_data="m:main")]
+        lines.append(tr("usual_expenses"))
+    row = ([Btn(tr("undo_last"), callback_data="exp:undo"), Btn(tr("edit_list"), callback_data="exp:list:main")]
+           if items else []) + [Btn(tr("done"), callback_data="m:main")]
     return "\n".join(lines), Markup(quick + [row])
 
 
 # ---------- edit the expenses: change a name or amount, delete one, say it was NOT paid from the drawer ----------
 def expense_list_screen(s, note=""):
     items = s["data"]["expenses"]
-    lines = ([esc(note), ""] if note else []) + ["<b>✏️ Edit expenses</b>", ""]
-    lines += expense_lines(s)[:-2] if items else ["<i>(none yet)</i>"]
+    lines = ([esc(note), ""] if note else []) + [tr("edit_expenses"), ""]
+    lines += expense_lines(s)[:-2] if items else [tr("none_yet")]
     if items:
         drawer = sum(e["amount"] for e in items if e.get("cash", True))
-        lines += ["", f"Total: <b>{n(sum(e['amount'] for e in items))}</b> · from the cash drawer: <b>{n(drawer)}</b>"]
-    lines += ["", "Tap an expense to change it."]
+        lines += ["", tr("drawer_line", total=n(sum(e['amount'] for e in items)), n=n(drawer))]
+    lines += ["", tr("tap_expense")]
     rows = [[Btn(f"{i}. {e['name'][:20]} · {n(e['amount'])}" + ("" if e.get("cash", True) else " 🚫"),
                  callback_data=f"exp:item:{i - 1}")] for i, e in enumerate(items, 1)]
-    rows.append([Btn("⬅️ Back", callback_data="exp:back")])
+    rows.append([Btn(tr("back"), callback_data="exp:back")])
     return "\n".join(lines), Markup(rows)
 
 
@@ -410,43 +459,41 @@ def expense_item_screen(s, idx, note=""):
     e = s["data"]["expenses"][idx]
     cash = e.get("cash", True)
     lines = ([esc(note), ""] if note else []) + [
-        f"<b>Expense {idx + 1}</b>", "", f"Name: <b>{esc(e['name'])}</b>", f"Amount: <b>{n(e['amount'])}</b>",
-        "Paid from the cash drawer: " + ("✅ yes" if cash else "🚫 no (not counted in the cash check)")]
+        tr("expense_n", n=idx + 1), "", tr("name", name=esc(e['name'])), tr("amount", amt=n(e['amount'])),
+        tr("drawer_yes") if cash else tr("drawer_no")]
     return "\n".join(lines), Markup([
-        [Btn("✏️ Name", callback_data=f"exp:ename:{idx}"), Btn("💲 Amount", callback_data=f"exp:eamt:{idx}")],
-        [Btn("🚫 Not from the drawer - tap to change" if not cash else "💵 From the drawer ✅ - tap to change",
-             callback_data=f"exp:tog:{idx}")],
-        [Btn("🗑 Delete", callback_data=f"exp:delq:{idx}"), Btn("⬅️ Back", callback_data="exp:list:keep")],
+        [Btn(tr("new_name"), callback_data=f"exp:ename:{idx}"), Btn(tr("new_amount"), callback_data=f"exp:eamt:{idx}")],
+        [Btn(tr("not_from_drawer") if not cash else tr("from_drawer"), callback_data=f"exp:tog:{idx}")],
+        [Btn(tr("delete"), callback_data=f"exp:delq:{idx}"), Btn(tr("back"), callback_data="exp:list:keep")],
     ])
 
 
 def step_screen(s, idx, note=""):
     step, data = STEPS[idx], s["data"]
-    lines = ([esc(note), ""] if note else []) + [f"<b>STEP {idx + 1} of {len(STEPS)}</b> · {dmy(s['date'])}", ""]
+    lines = ([esc(note), ""] if note else []) + [tr("step", n=idx + 1, total=len(STEPS), date=dmy(s['date'])), ""]
     if step[0] == "discount":
         d = data["discount"]
-        lines += ["<b>🏷 Discount</b> (optional)", "Type the amount, then the reason",
-                  "Example: <code>5 long stay</code>"]
+        lines += [tr("discount_optional"), tr("discount_type"), tr("example_line", example=tr("example_discount"))]
         if d.get("amount"):
-            lines += ["", f"Now: {n(d['amount'])} {esc(d.get('reason', ''))}".strip()]
-        lines += ["", "Nothing today? Tap Skip."]
+            lines += ["", tr("discount_now", amt=n(d['amount']), reason=esc(d.get('reason', ''))).strip()]
+        lines += ["", tr("nothing_today")]
     else:  # expense
-        lines += ["<b>💸 Expenses</b> (optional)", ""] + expense_lines(s) + [
-            "", "Type each one: name then amount", "Example: <code>water 12</code>", "Tap Done when finished."]
+        lines += [tr("expenses_optional"), ""] + expense_lines(s) + [
+            "", tr("type_each"), tr("example_line", example=tr("example_expense")), tr("tap_done")]
     nav = []
     if step[0] == "expense":
         if data["expenses"]:
-            nav.append(Btn("↩️ Undo last", callback_data="exp:undo"))
-        nav.append(Btn("✅ Done", callback_data="g:next"))
+            nav.append(Btn(tr("undo_last"), callback_data="exp:undo"))
+        nav.append(Btn(tr("done"), callback_data="g:next"))
     else:
-        nav.append(Btn("⏭ Skip", callback_data="g:next"))
+        nav.append(Btn(tr("skip"), callback_data="g:next"))
     if idx > 0:
-        nav.append(Btn("⬅️ Back", callback_data="g:back"))
-    second = ([Btn("✏️ Edit list", callback_data="exp:list:guided")] if step[0] == "expense" and data["expenses"] else []) \
-        + [Btn("☰ Menu", callback_data="g:stop")]
+        nav.append(Btn(tr("back"), callback_data="g:back"))
+    second = ([Btn(tr("edit_list"), callback_data="exp:list:guided")] if step[0] == "expense" and data["expenses"] else []) \
+        + [Btn(tr("menu"), callback_data="g:stop")]
     quick = quick_expense_rows(s) if step[0] == "expense" else []
     if quick:
-        lines.append("Or tap one of your usual expenses 👇")
+        lines.append(tr("usual_expenses"))
     return "\n".join(lines), Markup(quick + [nav, second])
 
 
@@ -479,31 +526,31 @@ def init_pad(s, step, nums=None):
 
 def pad_screen(ctx, s, note=""):
     w, pad = ctx.user_data["waiting"], ctx.user_data["pad"]
-    title = f"{TITLES[w[1]]} › {LABELS[w[1]][w[2]]}" if w[0] == "item" else "🍽 Bar / Restaurant"
+    title = f"{tr('rooms_btn' if w[1] == 'rooms' else 'tours_btn')} › {LABELS[w[1]][w[2]]}" \
+        if w[0] == "item" else tr("bar_restaurant")
     shown = [v or "0" for v in pad["vals"]]
     cells = [f"[{v}]" if i == pad["field"] else v for i, v in enumerate(shown)]
     g = ctx.user_data.get("guided")
     lines = ([esc(note), ""] if note else [])
     if g is not None:
-        lines.append(f"<b>STEP {g + 1} of {len(STEPS)}</b> · {dmy(s['date'])}")
+        lines.append(tr("step", n=g + 1, total=len(STEPS), date=dmy(s['date'])))
     lines += [f"<b>{title}</b>", "",
-              f"<pre>{'CASH':>9}{'CARD':>9}{'ABA':>9}\n{cells[0]:>9}{cells[1]:>9}{cells[2]:>9}</pre>",
-              f"Total: <b>{n(sum(val(v) for v in pad['vals']))}</b>", "",
-              "Pick Cash, Card or ABA, tap the numbers, then ✅ Save.",
-              "Or type it: <code>40 0 20</code>"]
+              f"<pre>{tr('cash_hdr'):>9}{tr('card_hdr'):>9}{tr('aba_hdr'):>9}\n{cells[0]:>9}{cells[1]:>9}{cells[2]:>9}</pre>",
+              tr("total", total=n(sum(val(v) for v in pad['vals']))), "",
+              tr("pick_field"), tr("or_type")]
     f = pad["field"]
-    names = ["💵 Cash", "💳 Card", "🏦 ABA"]
+    names = [tr("cash"), tr("card"), tr("aba")]
     rows = [[Btn(("▸ " if i == f else "") + names[i], callback_data=f"k:f{i}") for i in range(3)]]
     for r in (("7", "8", "9"), ("4", "5", "6"), ("1", "2", "3")):
         rows.append([Btn(d, callback_data=f"k:{d}") for d in r])
     rows.append([Btn("0", callback_data="k:0"), Btn(".", callback_data="k:."), Btn("⌫", callback_data="k:b")])
-    rows.append([Btn("🧹 Clear", callback_data="k:c"), Btn("Next field ➡️", callback_data="k:n")])
-    rows.append([Btn("✅ Save", callback_data="k:s")])
+    rows.append([Btn(tr("clear"), callback_data="k:c"), Btn(tr("next_field"), callback_data="k:n")])
+    rows.append([Btn(tr("save"), callback_data="k:s")])
     if g is not None:
-        rows.append([Btn("⏭ Skip", callback_data="g:next")] + ([Btn("⬅️ Back", callback_data="g:back")] if g > 0 else [])
-                    + [Btn("☰ Menu", callback_data="g:stop")])
+        rows.append([Btn(tr("skip"), callback_data="g:next")] + ([Btn(tr("back"), callback_data="g:back")] if g > 0 else [])
+                    + [Btn(tr("menu"), callback_data="g:stop")])
     else:
-        rows.append([Btn("⬅️ Back", callback_data=f"m:{w[1]}" if w[0] == "item" else "m:main")])
+        rows.append([Btn(tr("back"), callback_data=f"m:{w[1]}" if w[0] == "item" else "m:main")])
     return "\n".join(lines), Markup(rows)
 
 
@@ -557,13 +604,13 @@ def review_screen(s, note=""):
     data = s["data"]
     empty = not any(sum(three(v)) for grp in ("rooms", "tours") for v in data[grp].values()) \
         and not sum(three(data["bar"])) and not data["expenses"]
-    text = ((esc(note) + "\n\n") if note else "") + report_body(data, s["date"], "📋 REVIEW")
+    text = ((esc(note) + "\n\n") if note else "") + report_body(data, s["date"], tr("review_title"))
     cmp = compare_lines(s)
     text += ("\n" + "\n".join(cmp) if cmp else "")
-    text += ("\n\n⚠️ The report is empty." if empty else "") + "\n\nIs everything correct?"
+    text += (("\n\n" + tr("empty_report")) if empty else "") + "\n\n" + tr("is_correct")
     return text, Markup([
-        [Btn("✅ Confirm - send me the xlsx", callback_data="act:generate")],
-        [Btn("💵 Cash check", callback_data="cash:review"), Btn("✏️ Fix something", callback_data="m:main")],
+        [Btn(tr("confirm"), callback_data="act:generate")],
+        [Btn(tr("cash_btn"), callback_data="cash:review"), Btn(tr("fix_something"), callback_data="m:main")],
     ])
 
 
@@ -582,86 +629,88 @@ def compare_lines(s):
     out = []
     if vals[0]:
         p = (cur - vals[0]) / vals[0] * 100
-        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% vs {dmy(prev[0])[:5]} ({n(vals[0])})")
+        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% " + tr("vs_day", date=dmy(prev[0])[:5], rev=n(vals[0])))
     if len(vals) >= 3 and sum(vals) > 0:
         avg = sum(vals) / len(vals)
         p = (cur - avg) / avg * 100
-        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% vs the average of the last {len(vals)} days ({n(avg)})")
+        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% " + tr("vs_avg", n=len(vals), avg=n(avg)))
     return out
 
 
 def done_screen(s):
     sm = summarize(s["data"])
-    return (f"✅ <b>Report {dmy(s['date'])} saved</b>\n💰 Revenue {n(sm['total'])} · 💸 Expenses {n(sm['expenses'])}\n\n"
-            "Your xlsx file is above ☝️\nIt leaves the chat when you start the next task.\n"
-            "You can get it again any time from 📚 History.",
-            Markup([[Btn("✏️ Change something", callback_data="m:main")],
-                    [Btn("📚 History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")]]))
+    return (tr("report_saved", date=dmy(s['date'])) + "\n"
+            + tr("revenue_expenses", rev=n(sm['total']), exp=n(sm['expenses'])) + "\n\n"
+            + tr("file_above"),
+            Markup([[Btn(tr("change_something"), callback_data="m:main")],
+                    [Btn(tr("history"), callback_data="hist:0"), Btn(tr("home_btn"), callback_data="home")]]))
 
 
 def warn_screen(label, nums, cap):
-    return (f"⚠️ <b>Please check this number</b>\n\n{esc(label)}: <b>{esc(fmt(nums))}</b>\n"
-            f"The highest in your past reports is <b>{n(cap)}</b>.\nDid you type an extra digit?",
-            Markup([[Btn("✅ Yes, keep it", callback_data="w:ok"), Btn("✏️ Type again", callback_data="w:no")]]))
+    return (tr("warn_title") + "\n\n" + tr("warn_body", label=esc(label), nums=esc(fmt(nums))) + "\n"
+            + tr("warn_hint", cap=n(cap)),
+            Markup([[Btn(tr("yes_keep"), callback_data="w:ok"), Btn(tr("type_again"), callback_data="w:no")]]))
 
 
 def history_screen(page, note=""):
     items = history.list_reports()
     if not items:
-        return (esc(note) + "<b>📚 History</b>\n\nNo reports yet.\nFill a report and confirm it, and it will appear here.",
-                Markup([[Btn("▶️ Start today's report", callback_data="new"), Btn("🏠 Home", callback_data="home")],
-                        [Btn("🗂 Storage", callback_data="stor:0")]]))
+        return (esc(note) + tr("no_reports"),
+                Markup([[Btn(tr("start_new"), callback_data="new"), Btn(tr("home_btn"), callback_data="home")],
+                        [Btn(tr("storage"), callback_data="stor:0")]]))
     pages = (len(items) + PAGE - 1) // PAGE
     page = max(0, min(page, pages - 1))
-    rows = [[Btn("📊 Month summary", callback_data="mon:cur")]]
+    rows = [[Btn(tr("month_summary"), callback_data="mon:cur")]]
     for iso in items[page * PAGE:(page + 1) * PAGE]:
         data = history.load_report(iso)
         total = summarize(complete(data))["total"] if data else 0
-        rows.append([Btn(f"🗓 {dmy(iso)}  ·  revenue {n(total)}", callback_data=f"h:v:{iso}")])
+        rows.append([Btn(tr("day_row", date=dmy(iso), rev=n(total)), callback_data=f"h:v:{iso}")])
     nav = []
     if page > 0:
-        nav.append(Btn("⬅️ Newer", callback_data=f"hist:{page - 1}"))
+        nav.append(Btn(tr("newer"), callback_data=f"hist:{page - 1}"))
     if page < pages - 1:
-        nav.append(Btn("Older ➡️", callback_data=f"hist:{page + 1}"))
+        nav.append(Btn(tr("older"), callback_data=f"hist:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([Btn("🗂 Storage", callback_data="stor:0"), Btn("🏠 Home", callback_data="home")])
-    noun = "report" if len(items) == 1 else "reports"
-    return ((esc(note) + "\n\n" if note else "") + f"<b>📚 History</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
+    rows.append([Btn(tr("storage"), callback_data="stor:0"), Btn(tr("home_btn"), callback_data="home")])
+    return ((esc(note) + "\n\n" if note else "")
+            + tr("history_count", n=len(items), noun=noun(len(items), "report_one", "report_many"))
+            + "\n" + tr("tap_open")), Markup(rows)
 
 
 def report_view_markup(iso):
     return Markup([
-        [Btn("📥 Send file", callback_data=f"h:f:{iso}"), Btn("✏️ Update", callback_data=f"h:e:{iso}")],
-        [Btn("🗑 Delete", callback_data=f"h:d:{iso}")],
-        [Btn("⬅️ History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")],
+        [Btn(tr("send_file"), callback_data=f"h:f:{iso}"), Btn(tr("update"), callback_data=f"h:e:{iso}")],
+        [Btn(tr("delete"), callback_data=f"h:d:{iso}")],
+        [Btn(tr("history"), callback_data="hist:0"), Btn(tr("home_btn"), callback_data="home")],
     ])
 
 
 def report_view(data, iso):
-    return report_body(complete(data), iso, "📋 REPORT"), report_view_markup(iso)
+    return report_body(complete(data), iso, tr("report")), report_view_markup(iso)
 
 
 # ---------- storage: the report files you sent me ----------
 def storage_screen(page, note=""):
     items = storage.list_reports()
     if not items:
-        return (esc(note) + "<b>🗂 Storage</b>\n\nNo stored files yet.\n"
-                "Send me an .xlsx report and I will keep it here.",
-                Markup([[Btn("🏠 Home", callback_data="home")]]))
+        return (esc(note) + tr("storage_empty"),
+                Markup([[Btn(tr("home_btn"), callback_data="home")]]))
     pages = (len(items) + PAGE - 1) // PAGE
     page = max(0, min(page, pages - 1))
-    rows = [[Btn(f"🗓 {dmy(iso)}", callback_data=f"st:v:{iso}")] for iso in items[page * PAGE:(page + 1) * PAGE]]
+    rows = [[Btn(tr("storage_day", date=dmy(iso)), callback_data=f"st:v:{iso}")]
+            for iso in items[page * PAGE:(page + 1) * PAGE]]
     nav = []
     if page > 0:
-        nav.append(Btn("⬅️ Newer", callback_data=f"stor:{page - 1}"))
+        nav.append(Btn(tr("newer"), callback_data=f"stor:{page - 1}"))
     if page < pages - 1:
-        nav.append(Btn("Older ➡️", callback_data=f"stor:{page + 1}"))
+        nav.append(Btn(tr("older"), callback_data=f"stor:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([Btn("🏠 Home", callback_data="home")])
-    noun = "file" if len(items) == 1 else "files"
-    return ((esc(note) + "\n\n" if note else "") + f"<b>🗂 Storage</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
+    rows.append([Btn(tr("home_btn"), callback_data="home")])
+    return ((esc(note) + "\n\n" if note else "")
+            + tr("storage_title", n=len(items), noun=noun(len(items), "file_one", "file_many"))
+            + "\n" + tr("storage_tap")), Markup(rows)
 
 
 def import_body(data, date_label, title="📥 IMPORT"):
@@ -669,17 +718,20 @@ def import_body(data, date_label, title="📥 IMPORT"):
     sm = summarize(data)
     empty = not any(sum(three(v)) for g in ("rooms", "tours") for v in data[g].values()) \
         and not sum(three(data["bar"]))
-    parts = [f"<b>{title}</b> · {date_label}", ""]
+    parts = [tr("import_body", title=title, date=date_label), ""]
     if empty:
-        parts += ["<i>Nothing filled in the file.</i>"]
+        parts += [tr("nothing_in_file")]
     else:
-        parts += [f"<pre>{esc(table_block(data))}</pre>", f"💰 <b>Revenue {n(sm['total'])}</b>"]
+        parts += [f"<pre>{esc(table_block(data))}</pre>", tr("import_revenue", rev=n(sm['total']))]
     d = data["discount"]
     if d.get("amount"):
-        parts.append(f"🏷 Discount {n(d['amount'])}" + (f" · {esc(d.get('reason', ''))}" if d.get("reason") else ""))
+        line = tr("discount_line", amt=n(d['amount']))
+        if d.get("reason"):
+            line += tr("discount_reason", reason=esc(d['reason']))
+        parts.append(line)
     if data["expenses"]:
         items = "\n".join(f"{esc(e['name'])}: {n(e['amount'])}" for e in data["expenses"])
-        parts += [f"💸 Expenses {n(sm['expenses'])}", f"<pre>{items}</pre>"]
+        parts += [tr("import_expenses", exp=n(sm['expenses'])), f"<pre>{items}</pre>"]
     return "\n".join(parts)
 
 
@@ -699,27 +751,27 @@ def import_screen(ctx, note=""):
     imports = ctx.user_data.get("imports") or []
     if not imports:
         return home_screen()
-    noun = "file" if len(imports) == 1 else "files"
-    lines = [f"<b>📥 IMPORT</b> ({len(imports)} {noun})", ""]
+    n = len(imports)
+    lines = [tr("import_title", n=n, noun=noun(n, "file_one", "file_many")), ""]
     existing = []
     for i, imp in enumerate(imports, 1):
-        title = "📥 IMPORT" if len(imports) == 1 else f"File {i}"
+        title = tr("import_title_plain") if n == 1 else tr("import_file_plain", n=i)
         if imp["date"]:
             lines.append(import_body(imp["data"], dmy(imp["date"]), title))
             if history.load_report(imp["date"]) is not None:
                 existing.append(imp["date"])
         else:
-            lines.append(f"<b>{esc(imp['name'])}</b> · ❓ no date - type it as dd/mm/yyyy")
+            lines.append(tr("no_date", name=esc(imp['name'])))
         if imp["warnings"]:
             lines.append("⚠️ " + " · ".join(esc(w) for w in imp["warnings"]))
         lines.append("")
     if existing:
-        lines.append(f"⚠️ These days are already saved: {', '.join(dmy(d) for d in existing)}. They will be replaced.")
-    lines.append("Send every file, then tap Save all.")
+        lines.append(tr("already_saved", days=", ".join(dmy(d) for d in existing)))
+    lines.append(tr("send_every"))
     if note:
         lines.insert(0, esc(note) + "\n")
-    btns = [[Btn("🔁 Replace all" if existing else "✅ Save all", callback_data="imp:save"),
-             Btn("❌ Cancel", callback_data="imp:cancel")]]
+    btns = [[Btn(tr("replace_all") if existing else tr("save_all"), callback_data="imp:save"),
+             Btn(tr("cancel"), callback_data="imp:cancel")]]
     return "\n".join(lines), Markup(btns)
 
 
@@ -768,40 +820,39 @@ def cash_status(f):
     if not f["has"]:
         return ""
     if abs(f["diff"]) < 0.005:
-        return "✅ matches"
-    return f"⚠️ SHORT {n(-f['diff'])}" if f["diff"] < 0 else f"⚠️ OVER {n(f['diff'])}"
+        return tr("matches")
+    return tr("short", n=n(-f['diff'])) if f["diff"] < 0 else tr("over", n=n(f['diff']))
 
 
 def cash_screen(ctx, s, note=""):
     data = s["data"]
     step = (ctx.user_data.get("cash_ui") or {}).get("step", 1)
     f = cash_figures(data)
-    rows = [("Cash revenue", n(f["cash_rev"])), ("Expenses", "-" + n(f["expenses"]))]
+    rows = [(tr("cash_revenue"), n(f["cash_rev"])), (tr("expenses"), "-" + n(f["expenses"]))]
     if f["opening"]:
-        rows.append(("Opening cash", n(f["opening"])))
-    rows += [("Expected", n(f["expected"])), ("Counted", n(f["counted"]) if f["has"] else "-")]
+        rows.append((tr("opening_cash"), n(f["opening"])))
+    rows += [(tr("expected"), n(f["expected"])), (tr("counted"), n(f["counted"]) if f["has"] else tr("dash"))]
     if f["has"]:
-        rows.append(("Difference", sgn(f["diff"])))
+        rows.append((tr("difference"), sgn(f["diff"])))
     lines = ([esc(note), ""] if note else []) + [
-        f"<b>💵 CASH CHECK</b> · {dmy(s['date'])}", "",
+        tr("cash_check", date=dmy(s['date'])), "",
         "<pre>" + esc("\n".join(f"{a:<14}{b:>10}" for a, b in rows)) + "</pre>"]
     if f["has"]:
         lines.append(f"<b>{cash_status(f)}</b>")
         if f["typed"] is not None:
-            lines.append("<i>(you typed the total)</i>")
+            lines.append(tr("typed_total"))
     if f["other_expenses"]:
-        lines.append(f"🚫 Not from the drawer: {n(f['other_expenses'])} (not counted)")
-    lines += ["", "Expenses count as paid from the drawer, unless you mark them 🚫.",
-              "Tap ➕ / ➖ for each note. Step = how many notes per tap."]
+        lines.append(tr("not_from_drawer_n", n=n(f["other_expenses"])))
+    lines += ["", tr("cash_hint")]
     counts = ((data.get("cash_check") or {}).get("counts") or {}).get("usd", {})
-    rows_b = [[Btn(("▸ " if step == x else "") + f"Step {x}", callback_data=f"c:step:{x}") for x in (1, 5, 10)]]
+    rows_b = [[Btn(("▸ " if step == x else "") + tr("step_n", n=x), callback_data=f"c:step:{x}") for x in (1, 5, 10)]]
     for d in USD_NOTES:
         rows_b.append([Btn("➖", callback_data=f"c:-:{d}"),
                        Btn(f"${d} ×{counts.get(str(d), 0)}", callback_data="c:noop"),
                        Btn("➕", callback_data=f"c:+:{d}")])
-    rows_b.append([Btn("⌨️ Type total", callback_data="c:total"), Btn("🏁 Opening cash", callback_data="c:open")])
-    rows_b.append([Btn("💸 Edit expenses", callback_data="exp:list:cash")])
-    rows_b.append([Btn("🧹 Reset count", callback_data="c:reset"), Btn("✅ Done", callback_data="c:done")])
+    rows_b.append([Btn(tr("type_total"), callback_data="c:total"), Btn(tr("opening_btn"), callback_data="c:open")])
+    rows_b.append([Btn(tr("edit_expenses_btn"), callback_data="exp:list:cash")])
+    rows_b.append([Btn(tr("reset_count"), callback_data="c:reset"), Btn(tr("done"), callback_data="c:done")])
     return "\n".join(lines), Markup(rows_b)
 
 
@@ -829,7 +880,7 @@ def cash_lines(data):
     f = cash_figures(data)
     if not f["has"]:
         return []
-    return [f"💵 Cash check: expected {n(f['expected'])} · counted {n(f['counted'])} · {cash_status(f)}"]
+    return [tr("cash_line", exp=n(f['expected']), cnt=n(f['counted']), status=cash_status(f))]
 
 
 # ---------- month summary ----------
@@ -856,39 +907,40 @@ def shift_month(ym, k):
 
 
 def month_title(ym):
-    return f"{calendar.month_name[int(ym[5:7])]} {ym[:4]}"
+    return f"{month_name(int(ym[5:7]))} {ym[:4]}"
 
 
 def month_screen(ym, note=""):
     rows = month_rows(ym)
     st = monthly.stats(rows)
     prev_, next_ = shift_month(ym, -1), shift_month(ym, 1)
-    nav = [Btn(f"⬅️ {calendar.month_abbr[int(prev_[5:7])]}", callback_data=f"mon:{prev_}")]
+    nav = [Btn(f"⬅️ {month_abbr(int(prev_[5:7]))}", callback_data=f"mon:{prev_}")]
     if next_ <= today_iso()[:7]:
-        nav.append(Btn(f"{calendar.month_abbr[int(next_[5:7])]} ➡️", callback_data=f"mon:{next_}"))
-    foot = [Btn("📚 History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")]
-    head = ((esc(note) + "\n\n") if note else "") + f"<b>📊 {month_title(ym).upper()}</b>"
+        nav.append(Btn(f"{month_abbr(int(next_[5:7]))} ➡️", callback_data=f"mon:{next_}"))
+    foot = [Btn(tr("history"), callback_data="hist:0"), Btn(tr("home_btn"), callback_data="home")]
+    head = ((esc(note) + "\n\n") if note else "") + tr("month_title", title=month_title(ym).upper())
     if not st:
-        return head + "\n\nNo reports in this month yet.", Markup([nav, foot])
+        return head + "\n\n" + tr("no_month"), Markup([nav, foot])
     sd = lambda d: d.strftime("%d/%m")
-    lines = [head + f" · {st['days']} day{'s' if st['days'] != 1 else ''}", "",
-             f"<pre>{'':<10}{'CASH':>9}{'CARD':>9}{'ABA':>9}\n{'Revenue':<10}{n(st['cash']):>9}{n(st['card']):>9}{n(st['aba']):>9}</pre>",
-             f"💰 Revenue <b>{n(st['revenue'])}</b>",
-             f"   🛏 Rooms {n(st['rooms'])} · 🧳 Tours {n(st['tours'])} · 🍽 Bar {n(st['bar'])}",
-             f"💸 Expenses {n(st['expenses'])}",
-             f"📈 Net (revenue − expenses) <b>{n(st['net'])}</b>",
-             f"📅 Average {n(st['avg'])} per day",
-             f"⭐ Best day {sd(st['best'][0])}: {n(st['best'][1])}"]
+    lines = [head + tr("days", n=st['days'], noun=noun(st['days'], "day_one", "day_many")), "",
+             f"<pre>{'':<10}{tr('cash_hdr'):>9}{tr('card_hdr'):>9}{tr('aba_hdr'):>9}\n"
+             f"{tr('rooms'):<10}{n(st['cash']):>9}{n(st['card']):>9}{n(st['aba']):>9}</pre>",
+             tr("revenue", rev=n(st['revenue'])),
+             tr("rooms_line", rooms=n(st['rooms']), tours=n(st['tours']), bar=n(st['bar'])),
+             tr("expenses_line", exp=n(st['expenses'])),
+             tr("net", net=n(st['net'])),
+             tr("average", avg=n(st['avg'])),
+             tr("best", date=sd(st['best'][0]), rev=n(st['best'][1]))]
     if st["days"] > 1:
-        lines.append(f"🔻 Lowest day {sd(st['worst'][0])}: {n(st['worst'][1])}")
+        lines.append(tr("lowest", date=sd(st['worst'][0]), rev=n(st['worst'][1])))
     if st["counted_days"]:
-        parts = [f"💵 Cash check: {st['counted_days']} day(s) counted"]
+        parts = [tr("cash_month", n=st['counted_days'], noun=noun(st['counted_days'], "day_one", "day_many"))]
         if st["short"]:
-            parts.append(f"short {n(-st['short'])}")
+            parts.append(tr("short", n=n(-st['short'])))
         if st["over"]:
-            parts.append(f"over {n(st['over'])}")
+            parts.append(tr("over", n=n(st['over'])))
         lines.append(" · ".join(parts))
-    return "\n".join(lines), Markup([nav, [Btn("📥 Month xlsx", callback_data=f"monx:{ym}")], foot])
+    return "\n".join(lines), Markup([nav, [Btn(tr("month_xlsx"), callback_data=f"monx:{ym}")], foot])
 
 
 # ---------- mistake warning: a number far bigger than your past reports ----------
@@ -934,7 +986,7 @@ def commit_item(ctx, s, group, key, nums):
     save_draft_now(ctx, s)
     ctx.user_data.pop("pending", None)
     ctx.user_data.pop("pad", None)
-    note = f"✅ {LABELS[group][key]} saved: {fmt(nums)}"
+    note = tr("item_saved", label=LABELS[group][key], fmt=fmt(nums))
     g = ctx.user_data.get("guided")
     if g is not None:
         return enter_step(ctx, s, g + 1, note)
@@ -947,7 +999,7 @@ def commit_bar(ctx, s, nums):
     save_draft_now(ctx, s)
     ctx.user_data.pop("pending", None)
     ctx.user_data.pop("pad", None)
-    note = f"✅ Bar saved: {fmt(nums)}"
+    note = tr("bar_saved", fmt=fmt(nums))
     g = ctx.user_data.get("guided")
     if g is not None:
         return enter_step(ctx, s, g + 1, note)
@@ -958,7 +1010,7 @@ def commit_bar(ctx, s, nums):
 def commit_discount(ctx, s, amount, reason):
     s["data"]["discount"] = {"amount": amount, "reason": reason}
     save_draft_now(ctx, s)
-    note = f"✅ Discount saved: {n(amount)} {reason}".strip()
+    note = tr("discount_saved", amt=n(amount), reason=reason).strip()
     g = ctx.user_data.get("guided")
     if g is not None:
         return enter_step(ctx, s, g + 1, note)
@@ -1044,6 +1096,7 @@ async def delete_messages(ctx, ids):
 
 async def flash(ctx, text, seconds=8):
     """A short message that removes itself, so answers to commands do not fill the chat."""
+    set_lang(ctx)
     msg = await ctx.bot.send_message(OWNER, text)
 
     async def later():
@@ -1101,36 +1154,47 @@ async def deliver_file(ctx, data, iso, screen, old_panel_id):
 
 # ---------- commands and shortcuts: each opens a FRESH menu at the bottom ----------
 async def open_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, screen):
+    set_lang(ctx)
     for k in ("waiting", "guided", "pending", "pad", "cash_ui", "exp_from", "imports"):
         ctx.user_data.pop(k, None)
     old = ctx.user_data.get("panel")
     background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
     if not ctx.user_data.get("kb"):        # the two shortcut buttons at the bottom (sent once)
-        await update.message.reply_text("⌨️ Shortcuts are now at the bottom of your screen.", reply_markup=SHORTCUTS)
+        await update.message.reply_text(tr("shortcuts"), reply_markup=SHORTCUTS)
         ctx.user_data["kb"] = True
     msg, _ = await asyncio.gather(update.message.reply_text(screen[0], reply_markup=screen[1]), tidy(update))
     ctx.user_data["panel"] = msg.message_id
 
 
 async def home_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_lang(ctx)
     await open_panel(update, ctx, home_screen())
 
 
 async def today_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_lang(ctx)
     await open_panel(update, ctx, report_screen(start_session(ctx, today_iso())))
 
 
 async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_lang(ctx)
     await open_panel(update, ctx, history_screen(0))
 
 
 async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_lang(ctx)
     await open_panel(update, ctx, month_screen(today_iso()[:7]))
 
 
 async def keyboard_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["kb"] = False            # send the shortcut buttons again
+    set_lang(ctx)
     await open_panel(update, ctx, home_screen())
+
+
+async def lang_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_lang(ctx)
+    await open_panel(update, ctx, lang_screen())
 
 
 # ---------- button taps ----------
@@ -1146,14 +1210,15 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.message.chat.id != OWNER:
         return
+    set_lang(ctx)
     cmd = q.data
     current = ctx.user_data.get("panel")
     if current and q.message.message_id < current:         # an OLDER menu higher up in the chat
-        answer_later(q, "Old menu removed. Please use the last message.")
+        answer_later(q, tr("old_menu"))
         return background(delete_messages(ctx, [q.message.message_id]))
     ctx.user_data["panel"] = q.message.message_id
     if cmd != "act:generate" and not cmd.startswith("k:"):   # these answer later, with their own message
-        answer_later(q, "Sending file..." if cmd.startswith(("h:f:", "st:f:")) else None)
+        answer_later(q, tr("sending_file") if cmd.startswith(("h:f:", "st:f:")) else None)
     if cmd != "act:generate" and not cmd.startswith("h:f:"):
         clear_files_later(ctx)                              # new task: the old file leaves the chat
     if not cmd.startswith(("g:", "w:", "exp:", "k:")) and cmd not in ("act:generate", "review"):
@@ -1161,6 +1226,13 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop(k, None)
 
     # ----- home and history -----
+    if cmd.startswith("lang:"):
+        lang = cmd.split(":", 1)[1]
+        ctx.user_data["lang"] = lang if lang in ("en", "kh") else "en"
+        set_lang(ctx)
+        return await show(q, (tr("lang_title") + "\n\n"
+                              + (tr("lang_set") if ctx.user_data["lang"] == "en" else tr("lang_set_kh")),
+                              Markup([[Btn(tr("home_btn"), callback_data="home")]])))
     if cmd == "home":
         ctx.user_data.pop("waiting", None)
         return await show(q, home_screen())
@@ -1168,8 +1240,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await show(q, report_screen(start_session(ctx, today_iso())))
     if cmd == "newdate":
         ctx.user_data["waiting"] = ("newdate",)
-        return await show(q, prompt_screen("📅 Which day is the report for?", "25/10/2026", "home",
-                                           extra="Date as day/month/year\n"))
+        return await show(q, prompt_screen(tr("which_day"), tr("example_date"), "home",
+                                           extra=tr("date_format") + "\n"))
     if cmd.startswith("hist:"):
         ctx.user_data.pop("waiting", None)
         return await show(q, history_screen(int(cmd.split(":")[1])))
@@ -1181,7 +1253,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ym = cmd[5:]
         rows = month_rows(ym)
         if not rows:
-            return await show(q, month_screen(ym, "No reports in that month."))
+            return await show(q, month_screen(ym, tr("no_month_reports")))
         path = os.path.join(tempfile.gettempdir(), f"month_{ym}.xlsx")
         monthly.build_xlsx(path, month_title(ym), rows)
         return await deliver_path(ctx, path, f"{ym[5:7]}-{ym[:4]}_Month_Report.xlsx", month_screen(ym), q.message.message_id)
@@ -1189,7 +1261,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, action, iso = cmd.split(":", 2)
         data = history.load_report(iso)
         if action != "dy" and data is None:
-            return await show(q, history_screen(0, "That report was not found."))
+            return await show(q, history_screen(0, tr("not_found")))
         if action == "v":                                   # open one report
             return await show(q, report_view(data, iso))
         if action == "f":                                   # send its file again
@@ -1197,15 +1269,15 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "e":                                   # update (edit) it
             return await show(q, report_screen(start_session(ctx, iso, explicit=True)))
         if action == "d":                                   # ask before deleting
-            return await show(q, (f"🗑 <b>Delete the report of {dmy(iso)}?</b>\nThis cannot be undone.",
-                                  Markup([[Btn("Yes, delete", callback_data=f"h:dy:{iso}"),
-                                           Btn("Cancel", callback_data=f"h:v:{iso}")]])))
+            return await show(q, (tr("delete_report", date=dmy(iso)),
+                                  Markup([[Btn(tr("yes_delete"), callback_data=f"h:dy:{iso}"),
+                                           Btn(tr("cancel"), callback_data=f"h:v:{iso}")]])))
         if action == "dy":                                  # delete it
             old = history.load_report(iso)
             if old:
                 mark_undo(ctx, [("history", iso, {"data": old})], screen="history")
             history.delete_report(iso)
-            return await show(q, add_undo(ctx, history_screen(0, f"🗑 Deleted {dmy(iso)}")))
+            return await show(q, add_undo(ctx, history_screen(0, tr("deleted", date=dmy(iso)))))
 
     # ----- storage, drafts and imports -----
     if cmd.startswith("stor:"):
@@ -1214,7 +1286,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         iso = cmd.split(":", 2)[2]
         path = storage.stored_report_path(iso)
         if not path.exists():
-            return await show(q, storage_screen(0, "That file is not there any more."))
+            return await show(q, storage_screen(0, tr("file_gone")))
         try:
             d, data, warnings = importer.read_report(path, original_name=f"{iso}.xlsx")
         except importer.BadFile as e:
@@ -1223,47 +1295,47 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if warnings:
             text += "\n\n⚠️ " + "\n⚠️ ".join(esc(w) for w in warnings)
         return await show(q, (text, Markup([
-            [Btn("📥 Send file", callback_data=f"st:f:{iso}"), Btn("🗑 Delete", callback_data=f"st:d:{iso}")],
-            [Btn("⬅️ Storage", callback_data="stor:0")]])))
+            [Btn(tr("send_file"), callback_data=f"st:f:{iso}"), Btn(tr("delete"), callback_data=f"st:d:{iso}")],
+            [Btn(tr("storage_back"), callback_data="stor:0")]])))
     if cmd.startswith("st:f:"):
         iso = cmd.split(":", 2)[2]
         path = storage.stored_report_path(iso)
         if not path.exists():
-            return await show(q, storage_screen(0, "That file is not there any more."))
+            return await show(q, storage_screen(0, tr("file_gone")))
         return await deliver_path(ctx, path, file_name(iso), storage_screen(0), q.message.message_id, keep=True)
     if cmd.startswith("st:d:"):
         iso = cmd.split(":", 2)[2]
-        return await show(q, (f"🗑 <b>Delete the stored file of {dmy(iso)}?</b>",
-                              Markup([[Btn("Yes, delete", callback_data=f"st:dy:{iso}"),
-                                       Btn("Cancel", callback_data=f"st:v:{iso}")]])))
+        return await show(q, (tr("delete_stored", date=dmy(iso)),
+                              Markup([[Btn(tr("yes_delete"), callback_data=f"st:dy:{iso}"),
+                                       Btn(tr("cancel"), callback_data=f"st:v:{iso}")]])))
     if cmd.startswith("st:dy:"):
         iso = cmd.split(":", 2)[2]
         b64 = storage.stored_file_b64(iso)
         if b64:
             mark_undo(ctx, [("stored", iso, {"file_b64": b64})], screen="stored")
         storage.delete_stored_report(iso)
-        return await show(q, add_undo(ctx, storage_screen(0, f"🗑 Deleted {dmy(iso)}")))
+        return await show(q, add_undo(ctx, storage_screen(0, tr("deleted", date=dmy(iso)))))
     if cmd == "d:cont":
         return await show(q, report_screen(start_session(ctx, today_iso())))
     if cmd.startswith("d:cont:"):
         iso = cmd.split(":", 2)[2]
         return await show(q, report_screen(start_session(ctx, iso, explicit=True)))
     if cmd == "d:new":
-        return await show(q, ("🆕 <b>Start a new report?</b>\nYour draft will be moved to trash.",
-                              Markup([[Btn("Yes, start new", callback_data="d:newy"),
-                                       Btn("Cancel", callback_data="home")]])))
+        return await show(q, (tr("start_new_q"),
+                              Markup([[Btn(tr("yes_start_new"), callback_data="d:newy"),
+                                       Btn(tr("cancel"), callback_data="home")]])))
     if cmd == "d:newy":
         iso = today_iso()
         draft = storage.load_draft(iso)
         if draft:
             mark_undo(ctx, [("draft", iso, {"session": draft})], screen="report")
         s = start_session(ctx, iso, force_new=True)
-        return await show(q, add_undo(ctx, report_screen(s, "🆕 Started a new report")))
+        return await show(q, add_undo(ctx, report_screen(s, tr("started_new"))))
     if cmd.startswith("d:disc:"):
         iso = cmd.split(":", 2)[2]
-        return await show(q, (f"🗑 <b>Discard the draft of {dmy(iso)}?</b>",
-                              Markup([[Btn("Yes, discard", callback_data=f"d:discy:{iso}"),
-                                       Btn("Cancel", callback_data="home")]])))
+        return await show(q, (tr("discard_q", date=dmy(iso)),
+                              Markup([[Btn(tr("yes_discard"), callback_data=f"d:discy:{iso}"),
+                                       Btn(tr("cancel"), callback_data="home")]])))
     if cmd.startswith("d:discy:"):
         iso = cmd.split(":", 2)[2]
         draft = storage.load_draft(iso)
@@ -1292,9 +1364,10 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("imports", None)
         ctx.user_data.pop("waiting", None)
         if not saved_dates:
-            return await show(q, add_undo(ctx, import_screen(ctx, "⚠️ No date given yet.")))
+            return await show(q, add_undo(ctx, import_screen(ctx, tr("no_date_given"))))
         s = start_session(ctx, saved_dates[-1], explicit=True)
-        return await show(q, add_undo(ctx, report_screen(s, f"✅ Saved {len(saved_dates)} file(s)")))
+        return await show(q, add_undo(ctx, report_screen(
+            s, tr("import_saved", n=len(saved_dates), noun=noun(len(saved_dates), "file_one", "file_many")))))
     if cmd == "imp:cancel":
         ctx.user_data.pop("imports", None)
         ctx.user_data.pop("waiting", None)
@@ -1324,10 +1397,10 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif kind == "clear":
                 s["data"] = complete(copy.deepcopy(payload["data"]))
                 save_draft_now(ctx, s)
-        scr = {"history": lambda: history_screen(0, "↩️ Restored"),
-               "stored": lambda: storage_screen(0, "↩️ Restored"),
+        scr = {"history": lambda: history_screen(0, tr("restored")),
+               "stored": lambda: storage_screen(0, tr("restored")),
                "draft": home_screen,
-               "report": lambda: report_screen(s, "↩️ Restored"),
+               "report": lambda: report_screen(s, tr("restored")),
                "home": home_screen}.get(u["screen"], home_screen)
         return await show(q, add_undo(ctx, scr()))
 
@@ -1376,8 +1449,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if what in ("total", "open"):
             ctx.user_data["waiting"] = ({"total": ("cash_total",), "open": ("cash_open",)})[what]
             title, example, extra = {
-                "total": ("💵 Total cash counted", "160", "The total in dollars you counted\n"),
-                "open": ("🏁 Opening cash", "50", "Cash that was in the drawer before today's sales\n(0 if you take everything out each day)\n")}[what]
+                "total": (tr("total_counted"), tr("example_160"), tr("total_counted_extra")),
+                "open": (tr("opening_btn"), tr("example_50"), tr("opening_extra"))}[what]
             return await show(q, prompt_screen(title, example, "c:back", extra=extra))
         if what == "back":
             ctx.user_data.pop("waiting", None)
@@ -1392,9 +1465,9 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif cmd.startswith("k:"):                              # a key on the keypad
         w, pad = ctx.user_data.get("waiting"), ctx.user_data.get("pad")
         if not pad or not w or w[0] not in ("item", "bar"):   # e.g. a double tap after Save: do nothing
-            answer_later(q, "That keypad is closed.")
-            if "Pick Cash, Card or ABA" in (q.message.text or ""):   # an old keypad still on screen
-                await show(q, report_screen(s, "That keypad is closed. Choose an item again."))
+            answer_later(q, tr("keypad_closed"))
+            if tr("pick_field") in (q.message.text or ""):   # an old keypad still on screen
+                await show(q, report_screen(s, tr("keypad_closed_choose")))
             return
         answer_later(q)
         if cmd == "k:s":
@@ -1432,7 +1505,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         note = ""
         if data["expenses"]:
             gone = data["expenses"].pop()
-            note = f"↩️ Removed {gone['name']}: {n(gone['amount'])}"
+            note = tr("removed", name=gone['name'], amt=n(gone['amount']))
             save_draft_now(ctx, s)
         ctx.user_data["waiting"] = ("expense",)
         await show(q, expense_view(ctx, s, note))
@@ -1461,50 +1534,52 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 k = int(arg) if arg.isdigit() else -1
                 if 0 <= k < len(freq) and (len(parts) < 4 or str(name_key(freq[k][0])) == parts[3]):
                     items.append({"name": freq[k][0], "amount": freq[k][1]})
-                    note = f"✅ Added {freq[k][0]}: {n(freq[k][1])} (tap ✏️ Edit list to change the amount)"
+                    note = tr("added", name=freq[k][0], amt=n(freq[k][1])) + tr("added_hint")
                 else:
-                    note = "That list changed. Please tap again."
+                    note = tr("list_changed")
             else:
                 iso, old = last_expenses(s)
                 if old and not items:
                     items.extend(copy.deepcopy(old))
-                    note = f"✅ Added {len(old)} expense{'s' if len(old) != 1 else ''} from {dmy(iso)[:5]}"
+                    note = tr("added_from", n=len(old), noun=noun(len(old), "report_one", "report_many"),
+                              date=dmy(iso)[:5])
             save_draft_now(ctx, s)
             return await show(q, expense_view(ctx, s, note))
         i = int(arg) if arg.isdigit() else -1
         if not 0 <= i < len(items):                         # the list changed: show it again
-            return await show(q, expense_list_screen(s, "That expense is not there any more."))
+            return await show(q, expense_list_screen(s, tr("expense_gone")))
         ctx.user_data.pop("waiting", None)
         if what == "item":
             await show(q, expense_item_screen(s, i))
         elif what == "tog":
             items[i]["cash"] = not items[i].get("cash", True)
             save_draft_now(ctx, s)
-            await show(q, expense_item_screen(s, i, "✅ Changed"))
+            await show(q, expense_item_screen(s, i, tr("changed")))
         elif what in ("ename", "eamt"):
             ctx.user_data["waiting"] = ("exp_name" if what == "ename" else "exp_amount", i)
-            await show(q, prompt_screen("✏️ New name" if what == "ename" else "💲 New amount",
-                                        "tea" if what == "ename" else "12", f"exp:item:{i}",
-                                        extra=f"Now: {esc(items[i]['name']) if what == 'ename' else n(items[i]['amount'])}\n"))
+            await show(q, prompt_screen(tr("new_name") if what == "ename" else tr("new_amount"),
+                                        tr("example_tea") if what == "ename" else tr("example_12"), f"exp:item:{i}",
+                                        extra=tr("now", value=esc(items[i]['name']) if what == 'ename'
+                                                 else n(items[i]['amount'])) + "\n"))
         elif what == "delq":
             e = items[i]
-            await show(q, (f"🗑 <b>Delete this expense?</b>\n{esc(e['name'])}: {n(e['amount'])}",
-                           Markup([[Btn("Yes, delete", callback_data=f"exp:delyes:{i}"),
-                                    Btn("Cancel", callback_data=f"exp:item:{i}")]])))
+            await show(q, (tr("delete_expense") + f"\n{esc(e['name'])}: {n(e['amount'])}",
+                           Markup([[Btn(tr("yes_delete"), callback_data=f"exp:delyes:{i}"),
+                                    Btn(tr("cancel"), callback_data=f"exp:item:{i}")]])))
         elif what == "delyes":
             gone = items.pop(i)
             save_draft_now(ctx, s)
-            await show(q, expense_list_screen(s, f"🗑 Deleted {gone['name']}: {n(gone['amount'])}"))
+            await show(q, expense_list_screen(s, tr("deleted_item", name=gone['name'], amt=n(gone['amount']))))
     elif cmd == "act:reset":
-        await show(q, ("🗑 <b>Clear all numbers of this report?</b>\n(History is not changed.)",
-                       Markup([[Btn("Yes, clear", callback_data="act:resety"),
-                                Btn("No", callback_data="m:main")]])))
+        await show(q, (tr("clear_q"),
+                       Markup([[Btn(tr("yes_clear"), callback_data="act:resety"),
+                                Btn(tr("no"), callback_data="m:main")]])))
     elif cmd == "act:resety":
         mark_undo(ctx, [("clear", s["date"], {"data": copy.deepcopy(data)})], screen="report")
         s["data"] = fresh()
         ctx.user_data.pop("waiting", None)
         save_draft_now(ctx, s)
-        await show(q, add_undo(ctx, report_screen(s, "🗑 Cleared")))
+        await show(q, add_undo(ctx, report_screen(s, tr("cleared"))))
     elif cmd == "act:generate":
         try:
             history.save_report(s["date"], data)            # saved in History (replaces the same day)
@@ -1513,15 +1588,16 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for k in ("guided", "waiting", "pending", "pad"):
                 ctx.user_data.pop(k, None)
             await deliver_file(ctx, data, s["date"], done_screen(s), q.message.message_id)
-            await q.answer("✅ Saved to history")
+            await q.answer(tr("saved_history"))
         except Exception:
             logging.exception("could not make the report")
-            await q.answer("Sorry, could not make the file", show_alert=True)
+            await q.answer(tr("could_not_make"), show_alert=True)
 
 
 # ---------- typed messages ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    set_lang(ctx)
     if text.strip() in SHORTCUT_TEXTS:                      # the buttons at the bottom
         return await {"📝 Today": today_cmd, "📚 History": history_cmd, "📊 Month": month_cmd}[text.strip()](update, ctx)
     w = ctx.user_data.get("waiting")
@@ -1533,8 +1609,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             day = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
         except (AttributeError, ValueError):
             return await respond(update, ctx, prompt_screen(
-                "📅 Which day is the report for?", "25/10/2026", "home",
-                "⚠️ I cannot read that date.", "Date as day/month/year\n"))
+                tr("which_day"), tr("example_date"), "home", tr("bad_date"), tr("date_format") + "\n"))
         return await respond(update, ctx, report_screen(start_session(ctx, day.strftime("%Y-%m-%d"), explicit=True)))
 
     if w and w[0] == "importdate":                           # the date of an imported file
@@ -1547,7 +1622,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             day = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
         except (AttributeError, ValueError):
-            return await respond(update, ctx, import_screen(ctx, "⚠️ I cannot read that date."))
+            return await respond(update, ctx, import_screen(ctx, tr("bad_date")))
         imports[i]["date"] = day.strftime("%Y-%m-%d")
         next_missing_date(ctx)
         return await respond(update, ctx, import_screen(ctx))
@@ -1566,9 +1641,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data["expenses"] += parsed["expenses"]
         save_draft_now(ctx, s)
         got = parsed["rooms"] or parsed["tours"] or parsed["bar"] or parsed["discount"] or parsed["expenses"]
-        note = "✅ Saved from your message" if got else "⚠️ Tap a button below to choose what to fill."
+        note = tr("saved_from_msg") if got else tr("tap_button")
         if got and unknown:
-            note += "\nNot understood: " + "; ".join(unknown)
+            note += "\n" + tr("not_understood", items="; ".join(unknown))
         await respond(update, ctx, report_screen(s, note))
 
     elif w[0] in ("item", "bar"):
@@ -1576,7 +1651,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not nums:
             if "pad" not in ctx.user_data:
                 ctx.user_data["pad"] = init_pad(s, w)
-            return await respond(update, ctx, pad_screen(ctx, s, "⚠️ Please type numbers, or use the keypad."))
+            return await respond(update, ctx, pad_screen(ctx, s, tr("type_numbers")))
         await respond(update, ctx, submit_numbers(ctx, s, nums))
 
     elif w[0] in ("exp_name", "exp_amount"):
@@ -1584,34 +1659,35 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         items = data["expenses"]
         if not 0 <= i < len(items):
             ctx.user_data.pop("waiting", None)
-            return await respond(update, ctx, expense_list_screen(s, "That expense is not there any more."))
+            return await respond(update, ctx, expense_list_screen(s, tr("expense_gone")))
         if w[0] == "exp_name":
             name = text.strip()[:40]
             if not name:
-                return await respond(update, ctx, prompt_screen("✏️ New name", "tea", f"exp:item:{i}", "⚠️ Please type a name."))
+                return await respond(update, ctx, prompt_screen(tr("new_name"), tr("example_tea"), f"exp:item:{i}",
+                                                                tr("type_name")))
             items[i]["name"] = name
         else:
             nums = numbers(text)
             if not nums or nums[0] < 0:
-                return await respond(update, ctx, prompt_screen("💲 New amount", "12", f"exp:item:{i}",
-                                                                "⚠️ Please type a number (not negative)."))
+                return await respond(update, ctx, prompt_screen(tr("new_amount"), tr("example_12"), f"exp:item:{i}",
+                                                                tr("type_number")))
             items[i]["amount"] = nums[0]
         save_draft_now(ctx, s)
         ctx.user_data.pop("waiting", None)
-        await respond(update, ctx, expense_item_screen(s, i, "✅ Saved"))
+        await respond(update, ctx, expense_item_screen(s, i, tr("changed")))
 
     elif w[0] in ("cash_total", "cash_open"):
         nums = numbers(text)
         if not nums or nums[0] < 0:
-            return await respond(update, ctx, prompt_screen("💵 Cash check", "160", "c:back",
-                                                            "⚠️ Please type a number (not negative)."))
+            return await respond(update, ctx, prompt_screen(tr("cash_check_title"), tr("example_160"), "c:back",
+                                                            tr("type_number")))
         cc = data.setdefault("cash_check", {})
         if w[0] == "cash_total":
             cc["typed"] = nums[0]
-            note = f"✅ Counted total: {n(nums[0])}"
+            note = tr("counted_total", amt=n(nums[0]))
         else:
             cc["opening"] = nums[0]
-            note = f"✅ Opening cash: {n(nums[0])}"
+            note = tr("opening_saved", amt=n(nums[0]))
         save_draft_now(ctx, s)
         ctx.user_data.pop("waiting", None)
         ctx.user_data.setdefault("cash_ui", {"step": 1})
@@ -1620,28 +1696,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif w[0] == "discount":
         _, nums, rest = split_item(text)
         if not nums:
-            return await respond(update, ctx, discount_prompt("⚠️ Please type the amount first."))
+            return await respond(update, ctx, discount_prompt(tr("type_amount_first")))
         await respond(update, ctx, commit_discount(ctx, s, nums[0], " ".join(rest)))
 
     elif w[0] == "expense":
         words, nums, _ = split_item(text)
         if not words or not nums:
-            return await respond(update, ctx, expense_view(ctx, s, "⚠️ Type the name, then the amount. Example: water 12"))
+            return await respond(update, ctx, expense_view(ctx, s, tr("type_name_amount")))
         data["expenses"].append({"name": " ".join(words), "amount": nums[0]})
         save_draft_now(ctx, s)
-        await respond(update, ctx, expense_view(ctx, s, f"✅ Added {' '.join(words)}: {n(nums[0])}"))
+        await respond(update, ctx, expense_view(ctx, s, tr("added", name=" ".join(words), amt=n(nums[0]))))
 
 
 # ---------- evening reminder ----------
 async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data if ctx.user_data is not None else {}
+    set_lang(ctx)
     if history.load_report(today_iso()) is not None:      # today's report is already made: no need to bother you
         return
     old = ud.get("panel")
     background(delete_messages(ctx, ud.pop("files", []) + ([old] if old else [])))
     text, markup = home_screen()
     at = reminder_time().strftime("%I:%M %p").lstrip("0")
-    msg = await ctx.bot.send_message(OWNER, f"⏰ It is {at} - time to make today's hostel report.\n\n" + text,
+    msg = await ctx.bot.send_message(OWNER, tr("reminder", at=at) + "\n\n" + text,
                                      reply_markup=markup)
     ud["panel"] = msg.message_id
 
@@ -1656,10 +1733,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
             logging.error("CONFLICT: another copy of this bot is running (Render, another terminal, "
                           "another computer). Stop the other copy, or the buttons will act strangely.")
             try:
-                await ctx.bot.send_message(OWNER, "⚠️ Another copy of this bot is running somewhere "
-                                                  "(Render, another terminal or another computer).\n"
-                                                  "Stop it, or the buttons can act strangely "
-                                                  "(for example a number going to the wrong field).")
+                await ctx.bot.send_message(OWNER, tr("conflict"))
             except Exception:
                 pass
         return
@@ -1710,13 +1784,13 @@ async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t0 = perf_counter()
     await ctx.bot.get_me()
     took = perf_counter() - t0
-    verdict = "fast ✅" if took < 0.6 else ("OK" if took < 1.5 else "slow ⚠️ (check your internet or VPN)")
+    verdict = tr("fast") if took < 0.6 else (tr("ok") if took < 1.5 else tr("slow"))
     await asyncio.gather(tidy(update), flash(
-        ctx, f"🏓 Pong! Bot ↔ Telegram: <b>{took:.2f} s</b> · {verdict}\n<i>version {VERSION}</i>", seconds=10))
+        ctx, tr("pong", t=f"{took:.2f}", verdict=verdict) + f"\n<i>version {VERSION}</i>", seconds=10))
 
 
 async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await asyncio.gather(tidy(update), flash(ctx, "I do not know that command. Send /start for the menu.", seconds=6))
+    await asyncio.gather(tidy(update), flash(ctx, tr("unknown_cmd"), seconds=6))
 
 
 async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1724,30 +1798,29 @@ async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw, count = storage.backup_zip()
     await tidy(update)
     if not count:
-        return await flash(ctx, "There are no reports to back up yet.")
+        return await flash(ctx, tr("no_backup"))
     await ctx.bot.send_document(OWNER, document=raw, filename=f"hostel-backup-{today_iso()}.zip",
-                                caption=f"🗄 Backup of {count} report(s). Keep it safe: forward it to Saved Messages.")
+                                caption=tr("backup_of", n=count, noun=noun(count, "report_one", "report_many"))
+                                + " " + tr("keep_safe"))
 
 
 async def restore_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await asyncio.gather(tidy(update), flash(
-        ctx, "📥 To restore: send me the backup .zip file here.\nI add the days that are missing and never change a day that exists.",
-        seconds=15))
+    await asyncio.gather(tidy(update), flash(ctx, tr("restore_help"), seconds=15))
 
 
 async def import_document(update, ctx, doc):
     """Read an uploaded .xlsx report and show what the bot understood."""
     name = doc.file_name or ""
     if "/" in name or "\\" in name or ".." in name:      # never trust the file name
-        return await flash(ctx, "That file name is not allowed.")
+        return await flash(ctx, tr("name_not_allowed"))
     if (doc.file_size or 0) > importer.MAX_UPLOAD:
-        return await flash(ctx, "That file is too big. Please send a file up to 2 MB.")
+        return await flash(ctx, tr("too_big"))
     try:
         raw = bytes(await (await doc.get_file()).download_as_bytearray())
     except Exception:
-        return await flash(ctx, "I could not download that file. Please try again.")
+        return await flash(ctx, tr("download_fail"))
     if len(raw) > importer.MAX_UPLOAD:
-        return await flash(ctx, "That file is too big. Please send a file up to 2 MB.")
+        return await flash(ctx, tr("too_big"))
     tmp = os.path.join(tempfile.gettempdir(), f"upload_{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}.xlsx")
     try:
         with open(tmp, "wb") as f:
@@ -1771,33 +1844,35 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = (doc.file_name or "").lower()
     if name.endswith(".zip"):
         if (doc.file_size or 0) > 5_000_000:
-            return await flash(ctx, "I can only read a backup .zip file (up to 5 MB).")
+            return await flash(ctx, tr("only_zip"))
         try:
             raw = bytes(await (await doc.get_file()).download_as_bytearray())
         except Exception:
-            return await flash(ctx, "I could not download that file. Please try again.")
+            return await flash(ctx, tr("download_fail"))
         result = storage.restore_zip(raw)
         if result is None:
-            return await flash(ctx, "That zip file is not a valid backup.")
+            return await flash(ctx, tr("bad_zip"))
         added, skipped, ignored, files_added, files_skipped = result
-        await flash(ctx, f"✅ Backup read: {added} report(s) added, {skipped} already there"
-                         + (f", {ignored} file(s) ignored" if ignored else "")
-                         + (f" · {files_added} file(s) added, {files_skipped} already there"
+        await flash(ctx, tr("backup_read", added=added, noun=noun(added, "report_one", "report_many"), skipped=skipped)
+                         + (tr("ignored", n=ignored) if ignored else "")
+                         + (tr("files_added", added=files_added, skipped=files_skipped)
                             if (files_added or files_skipped) else "")
                          + ".", seconds=15)
     elif name.endswith(".xlsx"):
         await import_document(update, ctx, doc)
     else:
-        await flash(ctx, "I can only read a backup .zip or a report .xlsx file.")
+        await flash(ctx, tr("only_zip_xlsx"))
 
 
 async def weekly_backup(ctx: ContextTypes.DEFAULT_TYPE):
     """Every Sunday evening: a fresh backup. The previous weekly backup message is removed."""
+    set_lang(ctx)
     raw, count = storage.backup_zip()
     if not count:
         return
     msg = await ctx.bot.send_document(OWNER, document=raw, filename=f"hostel-backup-{today_iso()}.zip",
-                                      caption=f"🗄 Weekly backup of {count} report(s). Forward it to Saved Messages to keep it safe.")
+                                      caption=tr("weekly_backup", n=count, noun=noun(count, "report_one", "report_many"))
+                                      + " " + tr("keep_safe"))
     old = ctx.application.bot_data.get("backup_msg")
     ctx.application.bot_data["backup_msg"] = msg.message_id
     if old:
@@ -1814,6 +1889,7 @@ async def post_init(app: Application):
             BotCommand("month", "📊 Month summary"),
             BotCommand("backup", "🗄 Backup file"),
             BotCommand("ping", "🏓 Speed test"),
+            BotCommand("lang", "🌐 Language"),
         ])
     except Exception as e:
         logging.warning("Could not set the Menu button now (%s). The bot works anyway.", e)
@@ -1878,6 +1954,7 @@ def build_app():
     app.add_handler(CommandHandler("month", month_cmd, filters=only_me))
     app.add_handler(CommandHandler("backup", backup_cmd, filters=only_me))
     app.add_handler(CommandHandler("restore", restore_cmd, filters=only_me))
+    app.add_handler(CommandHandler("lang", lang_cmd, filters=only_me))
     app.add_handler(MessageHandler(only_me & filters.COMMAND, unknown_cmd))     # any other command
     app.add_handler(MessageHandler(only_me & filters.Document.ALL, on_document))
     app.add_handler(CallbackQueryHandler(on_button))

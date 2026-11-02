@@ -64,6 +64,8 @@ def parse(text):
         elif name in LOOKUP and nums:
             group, key = LOOKUP[name]
             data[group][key] = (nums + [0, 0, 0])[:3]
+        elif words and nums:                    # a free expense: 'water 12'
+            data["expenses"].append({"name": " ".join(words), "amount": nums[0]})
         else:
             unknown.append(item)
     return data, unknown

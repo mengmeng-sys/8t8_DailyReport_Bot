@@ -17,6 +17,8 @@ from telegram.request import HTTPXRequest
 
 import history
 import monthly
+import storage
+import importer
 from fill import fill_template, summarize
 from reader import parse as parse_rules, _split as split_item
 
@@ -29,7 +31,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER = int(os.environ["TELEGRAM_CHAT_ID"])  # only you can use the bot
 TZ = ZoneInfo("Asia/Phnom_Penh")
 PAGE = 8  # reports per page in History
-VERSION = "2026-10-31 month+backup+quick-expenses"   # shown in /ping and in the log, to see which file runs
+VERSION = "2026-11-02 storage+drafts+import"   # shown in /ping and in the log, to see which file runs
 
 
 def reminder_time():
@@ -99,9 +101,13 @@ def three(nums):
     return (list(nums) + [0, 0, 0])[:3]
 
 
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+
+
 def numbers(text):
+    """Read the numbers in a message. '1,087.85' is one number, '40,0,20' is three."""
     out = []
-    for t in text.replace(",", " ").split():
+    for t in _THOUSANDS.sub("", text).replace(",", " ").split():
         try:
             out.append(float(t))
         except ValueError:
@@ -144,12 +150,18 @@ def method_totals(data):
 
 
 # ---------- the report you are working on ("session") ----------
-def start_session(ctx, iso, explicit=False):
-    saved = history.load_report(iso)
-    ctx.user_data["session"] = {
-        "date": iso, "explicit": explicit, "saved": saved is not None,
-        "data": complete(copy.deepcopy(saved)) if saved else fresh(),
-    }
+def start_session(ctx, iso, explicit=False, force_new=False):
+    """Open a report. A draft is resumed, so unfinished work is never thrown away.
+    force_new=True starts empty (the caller has already trashed the draft)."""
+    draft = None if force_new else storage.load_draft(iso)
+    if draft:
+        data = complete(copy.deepcopy(draft["data"]))
+        explicit, saved = draft["explicit"], draft["saved"]
+    else:
+        saved_report = history.load_report(iso)
+        data = complete(copy.deepcopy(saved_report)) if saved_report else fresh()
+        saved = saved_report is not None
+    ctx.user_data["session"] = {"date": iso, "explicit": explicit, "saved": saved, "data": data}
     for k in ("waiting", "guided", "pending", "pad", "cash_ui"):
         ctx.user_data.pop(k, None)
     return ctx.user_data["session"]
@@ -161,6 +173,39 @@ def get_session(ctx):
     if s is None or (not s["explicit"] and s["date"] != today_iso()):
         s = start_session(ctx, today_iso())
     return s
+
+
+_DRAFT_TASKS = {}
+
+
+def save_draft_now(ctx, s):
+    """Write the draft at once (after a value was saved)."""
+    t = _DRAFT_TASKS.pop(OWNER, None)
+    if t:
+        t.cancel()
+    try:
+        storage.save_draft(s)
+    except Exception:
+        logging.exception("could not save the draft")
+
+
+def schedule_draft_save(ctx, s, delay=1.5):
+    """Debounce keypad digits: write the draft after a short pause."""
+    t = _DRAFT_TASKS.pop(OWNER, None)
+    if t:
+        t.cancel()
+
+    async def later():
+        try:
+            await asyncio.sleep(delay)
+            if ctx.user_data.get("session") is s:
+                storage.save_draft(s)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("could not save the draft")
+
+    _DRAFT_TASKS[OWNER] = asyncio.create_task(later())
 
 
 # ---------- the aligned table ----------
@@ -205,17 +250,37 @@ def report_body(data, iso, title):
 
 
 # ---------- screens: each returns (text, buttons) ----------
+def draft_banner():
+    """The unfinished drafts, as (text lines, buttons). Today first, then older days."""
+    today = today_iso()
+    lines, rows = [], []
+    draft = storage.load_draft(today)
+    if draft:
+        rev = summarize(complete(draft["data"]))["total"]
+        lines.append(f"📝 <b>Draft in progress</b>: {dmy(today)} · revenue {n(rev)} (not saved yet)")
+        rows.append([Btn("▶️ Continue draft", callback_data="d:cont"), Btn("🆕 Start new", callback_data="d:new")])
+    for d in storage.list_drafts(exclude=today):
+        iso = d["date"]
+        lines.append(f"🕓 Unfinished draft from {dmy(iso)}")
+        rows.append([Btn(f"▶️ Continue {dmy(iso)[:5]}", callback_data=f"d:cont:{iso}"),
+                     Btn("🗑 Discard", callback_data=f"d:disc:{iso}")])
+    return lines, rows
+
+
 def home_screen():
     saved = history.load_report(today_iso()) is not None
     text = ("<b>🏨 Hostel report</b>\n\n"
-            + ("Today's report is already saved ✅\n" if saved else "Today's report is not made yet.\n")
-            + "What do you want to do?")
+            + ("Today's report is already saved ✅\n" if saved else "Today's report is not made yet.\n"))
+    banner, banner_rows = draft_banner()
+    if banner:
+        text += "\n" + "\n".join(banner)
+    text += "\n\nWhat do you want to do?"
     start = "✏️ Update today's report" if saved else "▶️ Start today's report"
-    return text, Markup([
-        [Btn(start, callback_data="new")],
+    rows = [[Btn(start, callback_data="new")]] + banner_rows + [
         [Btn("📚 History", callback_data="hist:0"), Btn("📊 Month", callback_data="mon:cur")],
-        [Btn("📅 Other date", callback_data="newdate")],
-    ])
+        [Btn("📅 Other date", callback_data="newdate"), Btn("🗂 Storage", callback_data="stor:0")],
+    ]
+    return text, Markup(rows)
 
 
 def report_screen(s, note=""):
@@ -544,7 +609,8 @@ def history_screen(page, note=""):
     items = history.list_reports()
     if not items:
         return (esc(note) + "<b>📚 History</b>\n\nNo reports yet.\nFill a report and confirm it, and it will appear here.",
-                Markup([[Btn("▶️ Start today's report", callback_data="new"), Btn("🏠 Home", callback_data="home")]]))
+                Markup([[Btn("▶️ Start today's report", callback_data="new"), Btn("🏠 Home", callback_data="home")],
+                        [Btn("🗂 Storage", callback_data="stor:0")]]))
     pages = (len(items) + PAGE - 1) // PAGE
     page = max(0, min(page, pages - 1))
     rows = [[Btn("📊 Month summary", callback_data="mon:cur")]]
@@ -559,7 +625,7 @@ def history_screen(page, note=""):
         nav.append(Btn("Older ➡️", callback_data=f"hist:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([Btn("🏠 Home", callback_data="home")])
+    rows.append([Btn("🗂 Storage", callback_data="stor:0"), Btn("🏠 Home", callback_data="home")])
     noun = "report" if len(items) == 1 else "reports"
     return ((esc(note) + "\n\n" if note else "") + f"<b>📚 History</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
 
@@ -574,6 +640,85 @@ def report_view_markup(iso):
 
 def report_view(data, iso):
     return report_body(complete(data), iso, "📋 REPORT"), report_view_markup(iso)
+
+
+# ---------- storage: the report files you sent me ----------
+def storage_screen(page, note=""):
+    items = storage.list_reports()
+    if not items:
+        return (esc(note) + "<b>🗂 Storage</b>\n\nNo stored files yet.\n"
+                "Send me an .xlsx report and I will keep it here.",
+                Markup([[Btn("🏠 Home", callback_data="home")]]))
+    pages = (len(items) + PAGE - 1) // PAGE
+    page = max(0, min(page, pages - 1))
+    rows = [[Btn(f"🗓 {dmy(iso)}", callback_data=f"st:v:{iso}")] for iso in items[page * PAGE:(page + 1) * PAGE]]
+    nav = []
+    if page > 0:
+        nav.append(Btn("⬅️ Newer", callback_data=f"stor:{page - 1}"))
+    if page < pages - 1:
+        nav.append(Btn("Older ➡️", callback_data=f"stor:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([Btn("🏠 Home", callback_data="home")])
+    noun = "file" if len(items) == 1 else "files"
+    return ((esc(note) + "\n\n" if note else "") + f"<b>🗂 Storage</b> ({len(items)} {noun})\nTap one to open it."), Markup(rows)
+
+
+def import_body(data, date_label):
+    """The same aligned table as a report, for an imported file."""
+    sm = summarize(data)
+    empty = not any(sum(three(v)) for g in ("rooms", "tours") for v in data[g].values()) \
+        and not sum(three(data["bar"]))
+    parts = [f"<b>📥 IMPORT</b> · {date_label}", ""]
+    if empty:
+        parts += ["<i>Nothing filled in the file.</i>"]
+    else:
+        parts += [f"<pre>{esc(table_block(data))}</pre>", f"💰 <b>Revenue {n(sm['total'])}</b>"]
+    d = data["discount"]
+    if d.get("amount"):
+        parts.append(f"🏷 Discount {n(d['amount'])}" + (f" · {esc(d.get('reason', ''))}" if d.get("reason") else ""))
+    if data["expenses"]:
+        items = "\n".join(f"{esc(e['name'])}: {n(e['amount'])}" for e in data["expenses"])
+        parts += [f"💸 Expenses {n(sm['expenses'])}", f"<pre>{items}</pre>"]
+    return "\n".join(parts)
+
+
+def import_screen(ctx, note=""):
+    imp = ctx.user_data.get("import")
+    if not imp:
+        return home_screen()
+    if imp["date"]:
+        text = import_body(imp["data"], dmy(imp["date"]))
+        if history.load_report(imp["date"]) is not None:
+            text += f"\n\n⚠️ A report for {dmy(imp['date'])} is already saved in History."
+            btns = [[Btn("🔁 Replace", callback_data="imp:replace"), Btn("❌ Cancel", callback_data="imp:cancel")]]
+        else:
+            text += "\n\nSave this report?"
+            btns = [[Btn("✅ Save", callback_data="imp:save"), Btn("❌ Cancel", callback_data="imp:cancel")]]
+    else:
+        text = import_body(imp["data"], "date?") + "\n\n❓ I cannot find the date.\nType it as dd/mm/yyyy."
+        btns = [[Btn("❌ Cancel", callback_data="imp:cancel")]]
+    if imp["warnings"]:
+        text += "\n\n⚠️ " + "\n⚠️ ".join(esc(w) for w in imp["warnings"])
+    if note:
+        text = esc(note) + "\n\n" + text
+    return text, Markup(btns)
+
+
+def mark_undo(ctx, items, screen="home"):
+    """Copy the data to trash before a destructive action, so it can be undone."""
+    entries = [{"name": storage.trash(kind, iso, payload), "kind": kind, "iso": iso}
+               for kind, iso, payload in items]
+    ctx.user_data["undo"] = {"items": entries, "screen": screen, "at": monotonic()}
+
+
+def add_undo(ctx, screen):
+    """Add an [↩️ Undo] button if there is a recent destructive action."""
+    u = ctx.user_data.get("undo")
+    if not u or monotonic() - u["at"] > 600:
+        return screen
+    rows = [list(r) for r in screen[1].inline_keyboard] + [[Btn("↩️ Undo", callback_data="undo")]]
+    return screen[0], Markup(rows)
 
 
 # ---------- cash check: what the drawer should hold, and what you counted (dollars) ----------
@@ -719,7 +864,12 @@ def month_screen(ym, note=""):
     if st["days"] > 1:
         lines.append(f"🔻 Lowest day {sd(st['worst'][0])}: {n(st['worst'][1])}")
     if st["counted_days"]:
-        lines.append(f"💵 Cash check: {st['counted_days']} day(s) counted · short {n(-st['short'])} · over {n(st['over'])}")
+        parts = [f"💵 Cash check: {st['counted_days']} day(s) counted"]
+        if st["short"]:
+            parts.append(f"short {n(-st['short'])}")
+        if st["over"]:
+            parts.append(f"over {n(st['over'])}")
+        lines.append(" · ".join(parts))
     return "\n".join(lines), Markup([nav, [Btn("📥 Month xlsx", callback_data=f"monx:{ym}")], foot])
 
 
@@ -763,6 +913,7 @@ def submit_numbers(ctx, s, nums):
 
 def commit_item(ctx, s, group, key, nums):
     s["data"][group][key] = three(nums)
+    save_draft_now(ctx, s)
     ctx.user_data.pop("pending", None)
     ctx.user_data.pop("pad", None)
     note = f"✅ {LABELS[group][key]} saved: {fmt(nums)}"
@@ -775,6 +926,7 @@ def commit_item(ctx, s, group, key, nums):
 
 def commit_bar(ctx, s, nums):
     s["data"]["bar"] = three(nums)
+    save_draft_now(ctx, s)
     ctx.user_data.pop("pending", None)
     ctx.user_data.pop("pad", None)
     note = f"✅ Bar saved: {fmt(nums)}"
@@ -787,6 +939,7 @@ def commit_bar(ctx, s, nums):
 
 def commit_discount(ctx, s, amount, reason):
     s["data"]["discount"] = {"amount": amount, "reason": reason}
+    save_draft_now(ctx, s)
     note = f"✅ Discount saved: {n(amount)} {reason}".strip()
     g = ctx.user_data.get("guided")
     if g is not None:
@@ -901,14 +1054,14 @@ async def send_report(ctx, data, iso):
             os.remove(path)
 
 
-async def deliver_path(ctx, path, filename, screen, old_panel_id):
-    """Like deliver_file, for any file on disk (the month xlsx)."""
+async def deliver_path(ctx, path, filename, screen, old_panel_id, keep=False):
+    """Like deliver_file, for any file on disk (the month xlsx). keep=True for stored files."""
     clear_files_later(ctx)
     try:
         with open(path, "rb") as f:
             msg = await ctx.bot.send_document(OWNER, f, filename=filename)
     finally:
-        if os.path.exists(path):
+        if not keep and os.path.exists(path):
             os.remove(path)
     ctx.user_data.setdefault("files", []).append(msg.message_id)
     panel = await ctx.bot.send_message(OWNER, screen[0], reply_markup=screen[1])
@@ -930,7 +1083,7 @@ async def deliver_file(ctx, data, iso, screen, old_panel_id):
 
 # ---------- commands and shortcuts: each opens a FRESH menu at the bottom ----------
 async def open_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, screen):
-    for k in ("waiting", "guided", "pending", "pad"):
+    for k in ("waiting", "guided", "pending", "pad", "cash_ui", "exp_from", "import"):
         ctx.user_data.pop(k, None)
     old = ctx.user_data.get("panel")
     background(delete_messages(ctx, ctx.user_data.pop("files", []) + ([old] if old else [])))
@@ -982,7 +1135,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return background(delete_messages(ctx, [q.message.message_id]))
     ctx.user_data["panel"] = q.message.message_id
     if cmd != "act:generate" and not cmd.startswith("k:"):   # these answer later, with their own message
-        answer_later(q, "Sending file..." if cmd.startswith("h:f:") else None)
+        answer_later(q, "Sending file..." if cmd.startswith(("h:f:", "st:f:")) else None)
     if cmd != "act:generate" and not cmd.startswith("h:f:"):
         clear_files_later(ctx)                              # new task: the old file leaves the chat
     if not cmd.startswith(("g:", "w:", "exp:", "k:")) and cmd not in ("act:generate", "review"):
@@ -1030,12 +1183,132 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                   Markup([[Btn("Yes, delete", callback_data=f"h:dy:{iso}"),
                                            Btn("Cancel", callback_data=f"h:v:{iso}")]])))
         if action == "dy":                                  # delete it
+            old = history.load_report(iso)
+            if old:
+                mark_undo(ctx, [("history", iso, {"data": old})], screen="history")
             history.delete_report(iso)
-            return await show(q, history_screen(0, f"🗑 Deleted {dmy(iso)}"))
+            return await show(q, add_undo(ctx, history_screen(0, f"🗑 Deleted {dmy(iso)}")))
+
+    # ----- storage, drafts and imports -----
+    if cmd.startswith("stor:"):
+        return await show(q, storage_screen(int(cmd.split(":")[1])))
+    if cmd.startswith("st:v:"):
+        iso = cmd.split(":", 2)[2]
+        path = storage.stored_report_path(iso)
+        if not path.exists():
+            return await show(q, storage_screen(0, "That file is not there any more."))
+        try:
+            d, data, warnings = importer.read_report(path, original_name=f"{iso}.xlsx")
+        except importer.BadFile as e:
+            return await show(q, storage_screen(0, e.message))
+        text = import_body(data, dmy(iso))
+        if warnings:
+            text += "\n\n⚠️ " + "\n⚠️ ".join(esc(w) for w in warnings)
+        return await show(q, (text, Markup([
+            [Btn("📥 Send file", callback_data=f"st:f:{iso}"), Btn("🗑 Delete", callback_data=f"st:d:{iso}")],
+            [Btn("⬅️ Storage", callback_data="stor:0")]])))
+    if cmd.startswith("st:f:"):
+        iso = cmd.split(":", 2)[2]
+        path = storage.stored_report_path(iso)
+        if not path.exists():
+            return await show(q, storage_screen(0, "That file is not there any more."))
+        return await deliver_path(ctx, path, file_name(iso), storage_screen(0), q.message.message_id, keep=True)
+    if cmd.startswith("st:d:"):
+        iso = cmd.split(":", 2)[2]
+        return await show(q, (f"🗑 <b>Delete the stored file of {dmy(iso)}?</b>",
+                              Markup([[Btn("Yes, delete", callback_data=f"st:dy:{iso}"),
+                                       Btn("Cancel", callback_data=f"st:v:{iso}")]])))
+    if cmd.startswith("st:dy:"):
+        iso = cmd.split(":", 2)[2]
+        b64 = storage.stored_file_b64(iso)
+        if b64:
+            mark_undo(ctx, [("stored", iso, {"file_b64": b64})], screen="stored")
+        storage.delete_stored_report(iso)
+        return await show(q, add_undo(ctx, storage_screen(0, f"🗑 Deleted {dmy(iso)}")))
+    if cmd == "d:cont":
+        return await show(q, report_screen(start_session(ctx, today_iso())))
+    if cmd.startswith("d:cont:"):
+        iso = cmd.split(":", 2)[2]
+        return await show(q, report_screen(start_session(ctx, iso, explicit=True)))
+    if cmd == "d:new":
+        return await show(q, ("🆕 <b>Start a new report?</b>\nYour draft will be moved to trash.",
+                              Markup([[Btn("Yes, start new", callback_data="d:newy"),
+                                       Btn("Cancel", callback_data="home")]])))
+    if cmd == "d:newy":
+        iso = today_iso()
+        draft = storage.load_draft(iso)
+        if draft:
+            mark_undo(ctx, [("draft", iso, {"session": draft})], screen="report")
+        s = start_session(ctx, iso, force_new=True)
+        return await show(q, add_undo(ctx, report_screen(s, "🆕 Started a new report")))
+    if cmd.startswith("d:disc:"):
+        iso = cmd.split(":", 2)[2]
+        return await show(q, (f"🗑 <b>Discard the draft of {dmy(iso)}?</b>",
+                              Markup([[Btn("Yes, discard", callback_data=f"d:discy:{iso}"),
+                                       Btn("Cancel", callback_data="home")]])))
+    if cmd.startswith("d:discy:"):
+        iso = cmd.split(":", 2)[2]
+        draft = storage.load_draft(iso)
+        if draft:
+            mark_undo(ctx, [("draft", iso, {"session": draft})], screen="home")
+        storage.delete_draft(iso)
+        return await show(q, add_undo(ctx, home_screen()))
+    if cmd in ("imp:save", "imp:replace"):
+        imp = ctx.user_data.get("import")
+        if not imp or not imp["date"]:
+            ctx.user_data.pop("import", None)
+            return await show(q, home_screen())
+        iso = imp["date"]
+        items = []
+        if cmd == "imp:replace":
+            old = history.load_report(iso)
+            if old:
+                items.append(("history", iso, {"data": old}))
+            b64 = storage.stored_file_b64(iso)
+            if b64:
+                items.append(("stored", iso, {"file_b64": b64}))
+        if items:
+            mark_undo(ctx, items, screen="report")
+        history.save_report(iso, imp["data"])
+        storage.store_report(iso, imp["raw"])
+        ctx.user_data.pop("import", None)
+        s = start_session(ctx, iso, explicit=True)
+        return await show(q, add_undo(ctx, report_screen(s, "✅ Imported and saved")))
+    if cmd == "imp:cancel":
+        ctx.user_data.pop("import", None)
+        ctx.user_data.pop("waiting", None)
+        return await show(q, home_screen())
 
     # ----- filling the report -----
     s = get_session(ctx)
     data = s["data"]
+
+    if cmd == "undo":                                       # put back what was just deleted
+        u = ctx.user_data.pop("undo", None)
+        if not u:
+            return
+        for it in reversed(u["items"]):
+            payload = storage.restore_trash(it["name"])
+            storage.delete_trash(it["name"])
+            if payload is None:
+                continue
+            kind, iso = it["kind"], it["iso"]
+            if kind == "history":
+                history.save_report(iso, payload["data"])
+            elif kind == "stored":
+                storage.restore_stored(iso, payload["file_b64"])
+            elif kind == "draft":
+                storage.save_draft(payload["session"])
+                s = start_session(ctx, iso, explicit=True)   # put the draft back in memory too
+            elif kind == "clear":
+                s["data"] = complete(copy.deepcopy(payload["data"]))
+                save_draft_now(ctx, s)
+        scr = {"history": lambda: history_screen(0, "↩️ Restored"),
+               "stored": lambda: storage_screen(0, "↩️ Restored"),
+               "draft": home_screen,
+               "report": lambda: report_screen(s, "↩️ Restored"),
+               "home": home_screen}.get(u["screen"], home_screen)
+        return await show(q, add_undo(ctx, scr()))
 
     if cmd == "m:main":
         ctx.user_data.pop("waiting", None)
@@ -1089,6 +1362,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("waiting", None)
             return await show(q, cash_screen(ctx, s))
         if cash_change(ctx, s, cmd):
+            save_draft_now(ctx, s)
             ui["v"] = ui.get("v", 0) + 1
             async with pad_lock():                          # fast taps: draw only the newest numbers
                 if ctx.user_data.get("cash_ui") is ui and ui.get("shown") != ui["v"] and not ctx.user_data.get("waiting"):
@@ -1108,6 +1382,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show(q, screen)
         else:
             press_key(pad, cmd[2:])                         # the numbers change at once, in tap order
+            schedule_draft_save(ctx, s)                     # debounced: do not write on every digit
             pad["v"] = pad.get("v", 0) + 1
             async with pad_lock():
                 still_open = ctx.user_data.get("pad") is pad and ctx.user_data.get("waiting")
@@ -1137,6 +1412,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if data["expenses"]:
             gone = data["expenses"].pop()
             note = f"↩️ Removed {gone['name']}: {n(gone['amount'])}"
+            save_draft_now(ctx, s)
         ctx.user_data["waiting"] = ("expense",)
         await show(q, expense_view(ctx, s, note))
     elif cmd.startswith("exp:") and cmd != "exp:undo":      # edit the expenses
@@ -1172,6 +1448,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if old and not items:
                     items.extend(copy.deepcopy(old))
                     note = f"✅ Added {len(old)} expense{'s' if len(old) != 1 else ''} from {dmy(iso)[:5]}"
+            save_draft_now(ctx, s)
             return await show(q, expense_view(ctx, s, note))
         i = int(arg) if arg.isdigit() else -1
         if not 0 <= i < len(items):                         # the list changed: show it again
@@ -1181,6 +1458,7 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show(q, expense_item_screen(s, i))
         elif what == "tog":
             items[i]["cash"] = not items[i].get("cash", True)
+            save_draft_now(ctx, s)
             await show(q, expense_item_screen(s, i, "✅ Changed"))
         elif what in ("ename", "eamt"):
             ctx.user_data["waiting"] = ("exp_name" if what == "ename" else "exp_amount", i)
@@ -1194,18 +1472,22 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     Btn("Cancel", callback_data=f"exp:item:{i}")]])))
         elif what == "delyes":
             gone = items.pop(i)
+            save_draft_now(ctx, s)
             await show(q, expense_list_screen(s, f"🗑 Deleted {gone['name']}: {n(gone['amount'])}"))
     elif cmd == "act:reset":
         await show(q, ("🗑 <b>Clear all numbers of this report?</b>\n(History is not changed.)",
                        Markup([[Btn("Yes, clear", callback_data="act:resety"),
                                 Btn("No", callback_data="m:main")]])))
     elif cmd == "act:resety":
+        mark_undo(ctx, [("clear", s["date"], {"data": copy.deepcopy(data)})], screen="report")
         s["data"] = fresh()
         ctx.user_data.pop("waiting", None)
-        await show(q, report_screen(s, "🗑 Cleared"))
+        save_draft_now(ctx, s)
+        await show(q, add_undo(ctx, report_screen(s, "🗑 Cleared")))
     elif cmd == "act:generate":
         try:
             history.save_report(s["date"], data)            # saved in History (replaces the same day)
+            storage.delete_draft(s["date"])                 # the report is finished: no draft any more
             s["saved"] = True
             for k in ("guided", "waiting", "pending", "pad"):
                 ctx.user_data.pop(k, None)
@@ -1234,6 +1516,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "⚠️ I cannot read that date.", "Date as day/month/year\n"))
         return await respond(update, ctx, report_screen(start_session(ctx, day.strftime("%Y-%m-%d"), explicit=True)))
 
+    if w and w[0] == "importdate":                           # the date of an imported file
+        if not ctx.user_data.get("import"):
+            ctx.user_data.pop("waiting", None)
+            return await respond(update, ctx, home_screen())
+        m = re.search(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", text)
+        try:
+            day = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except (AttributeError, ValueError):
+            return await respond(update, ctx, import_screen(ctx, "⚠️ I cannot read that date."))
+        ctx.user_data["import"]["date"] = day.strftime("%Y-%m-%d")
+        ctx.user_data.pop("waiting", None)
+        return await respond(update, ctx, import_screen(ctx))
+
     s = get_session(ctx)
     data = s["data"]
 
@@ -1246,6 +1541,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if parsed["discount"]:
             data["discount"] = parsed["discount"]
         data["expenses"] += parsed["expenses"]
+        save_draft_now(ctx, s)
         got = parsed["rooms"] or parsed["tours"] or parsed["bar"] or parsed["discount"] or parsed["expenses"]
         note = "✅ Saved from your message" if got else "⚠️ Tap a button below to choose what to fill."
         if got and unknown:
@@ -1277,6 +1573,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return await respond(update, ctx, prompt_screen("💲 New amount", "12", f"exp:item:{i}",
                                                                 "⚠️ Please type a number (not negative)."))
             items[i]["amount"] = nums[0]
+        save_draft_now(ctx, s)
         ctx.user_data.pop("waiting", None)
         await respond(update, ctx, expense_item_screen(s, i, "✅ Saved"))
 
@@ -1292,6 +1589,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             cc["opening"] = nums[0]
             note = f"✅ Opening cash: {n(nums[0])}"
+        save_draft_now(ctx, s)
         ctx.user_data.pop("waiting", None)
         ctx.user_data.setdefault("cash_ui", {"step": 1})
         await respond(update, ctx, cash_screen(ctx, s, note))
@@ -1307,6 +1605,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not words or not nums:
             return await respond(update, ctx, expense_view(ctx, s, "⚠️ Type the name, then the amount. Example: water 12"))
         data["expenses"].append({"name": " ".join(words), "amount": nums[0]})
+        save_draft_now(ctx, s)
         await respond(update, ctx, expense_view(ctx, s, f"✅ Added {' '.join(words)}: {n(nums[0])}"))
 
 
@@ -1398,8 +1697,8 @@ async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/backup: all your reports in one zip file."""
-    raw, count = history.backup_zip()
+    """/backup: all your reports and stored files in one zip file."""
+    raw, count = storage.backup_zip()
     await tidy(update)
     if not count:
         return await flash(ctx, "There are no reports to back up yet.")
@@ -1413,24 +1712,65 @@ async def restore_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         seconds=15))
 
 
+async def import_document(update, ctx, doc):
+    """Read an uploaded .xlsx report and show what the bot understood."""
+    name = doc.file_name or ""
+    if "/" in name or "\\" in name or ".." in name:      # never trust the file name
+        return await flash(ctx, "That file name is not allowed.")
+    if (doc.file_size or 0) > importer.MAX_UPLOAD:
+        return await flash(ctx, "That file is too big. Please send a file up to 2 MB.")
+    try:
+        raw = bytes(await (await doc.get_file()).download_as_bytearray())
+    except Exception:
+        return await flash(ctx, "I could not download that file. Please try again.")
+    if len(raw) > importer.MAX_UPLOAD:
+        return await flash(ctx, "That file is too big. Please send a file up to 2 MB.")
+    tmp = os.path.join(tempfile.gettempdir(), f"upload_{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}.xlsx")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        d, data, warnings = importer.read_report(tmp, original_name=doc.file_name)
+    except importer.BadFile as e:
+        return await flash(ctx, e.message, seconds=12)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    ctx.user_data["import"] = {"date": d, "data": data, "warnings": warnings, "raw": raw, "name": doc.file_name}
+    if not d:
+        ctx.user_data["waiting"] = ("importdate",)
+    await refresh(ctx, import_screen(ctx))
+
+
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """You send a backup zip: the missing days are added to History."""
+    """A backup zip, or a report .xlsx to read back."""
     doc = update.message.document
     await tidy(update)
-    if not (doc.file_name or "").lower().endswith(".zip") or (doc.file_size or 0) > 5_000_000:
-        return await flash(ctx, "I can only read a backup .zip file (up to 5 MB).")
-    raw = bytes(await (await doc.get_file()).download_as_bytearray())
-    result = history.restore_zip(raw)
-    if result is None:
-        return await flash(ctx, "That zip file is not a valid backup.")
-    added, skipped, ignored = result
-    await flash(ctx, f"✅ Backup read: {added} report(s) added, {skipped} already there"
-                     + (f", {ignored} file(s) ignored" if ignored else "") + ".", seconds=15)
+    name = (doc.file_name or "").lower()
+    if name.endswith(".zip"):
+        if (doc.file_size or 0) > 5_000_000:
+            return await flash(ctx, "I can only read a backup .zip file (up to 5 MB).")
+        try:
+            raw = bytes(await (await doc.get_file()).download_as_bytearray())
+        except Exception:
+            return await flash(ctx, "I could not download that file. Please try again.")
+        result = storage.restore_zip(raw)
+        if result is None:
+            return await flash(ctx, "That zip file is not a valid backup.")
+        added, skipped, ignored, files_added, files_skipped = result
+        await flash(ctx, f"✅ Backup read: {added} report(s) added, {skipped} already there"
+                         + (f", {ignored} file(s) ignored" if ignored else "")
+                         + (f" · {files_added} file(s) added, {files_skipped} already there"
+                            if (files_added or files_skipped) else "")
+                         + ".", seconds=15)
+    elif name.endswith(".xlsx"):
+        await import_document(update, ctx, doc)
+    else:
+        await flash(ctx, "I can only read a backup .zip or a report .xlsx file.")
 
 
 async def weekly_backup(ctx: ContextTypes.DEFAULT_TYPE):
     """Every Sunday evening: a fresh backup. The previous weekly backup message is removed."""
-    raw, count = history.backup_zip()
+    raw, count = storage.backup_zip()
     if not count:
         return
     msg = await ctx.bot.send_document(OWNER, document=raw, filename=f"hostel-backup-{today_iso()}.zip",
@@ -1497,8 +1837,8 @@ def start_health_server():
     print(f"Health page on port {port}")
 
 
-def main():
-    start_health_server()
+def build_app():
+    """Build the Application (used by main() and by the tests)."""
     app = (Application.builder().token(TOKEN)
            .defaults(Defaults(parse_mode=ParseMode.HTML))
            .post_init(post_init)
@@ -1530,6 +1870,12 @@ def main():
         app.job_queue.run_repeating(self_ping, interval=minutes * 60, first=60)
         print(f"Self-ping every {minutes} min to {self_url()}")
     app.job_queue.run_daily(weekly_backup, time=time(22, 0, tzinfo=TZ), days=(0,))   # Sunday 22:00
+    return app
+
+
+def main():
+    start_health_server()
+    app = build_app()
     print(f"Bot is running (version {VERSION}). Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
     app.run_polling(bootstrap_retries=-1)   # if Telegram cannot be reached at start, keep trying
 

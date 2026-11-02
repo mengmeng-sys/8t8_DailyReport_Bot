@@ -129,6 +129,14 @@ class Harness:
     async def msg(self, text=None, document=None):
         await self._send({"update_id": self.fake._next_id(), "message": self._message(text, document)})
 
+    async def voice(self, file_id="v1", file_size=1234):
+        await self._send({"update_id": self.fake._next_id(), "message": {
+            "message_id": self.fake._next_id(), "date": DATE,
+            "chat": {"id": OWNER, "type": "private", "first_name": "Me"},
+            "from": {"id": OWNER, "is_bot": False, "first_name": "Me"},
+            "voice": {"file_id": file_id, "file_unique_id": "u" + file_id, "duration": 3,
+                      "mime_type": "audio/ogg"}}})
+
     def panel_id(self):
         for m in reversed(self.fake.messages):
             if m["method"] in ("sendMessage", "editMessageText"):

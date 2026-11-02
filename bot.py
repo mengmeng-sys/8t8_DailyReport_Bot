@@ -19,6 +19,7 @@ import history
 import monthly
 import storage
 import importer
+import speech
 import lang
 from fill import fill_template, summarize
 from reader import parse as parse_rules, _split as split_item
@@ -537,7 +538,7 @@ def pad_screen(ctx, s, note=""):
     lines += [f"<b>{title}</b>", "",
               f"<pre>{tr('cash_hdr'):>9}{tr('card_hdr'):>9}{tr('aba_hdr'):>9}\n{cells[0]:>9}{cells[1]:>9}{cells[2]:>9}</pre>",
               tr("total", total=n(sum(val(v) for v in pad['vals']))), "",
-              tr("pick_field"), tr("or_type")]
+              tr("pick_field"), tr("or_type"), tr("or_voice")]
     f = pad["field"]
     names = [tr("cash"), tr("card"), tr("aba")]
     rows = [[Btn(("▸ " if i == f else "") + names[i], callback_data=f"k:f{i}") for i in range(3)]]
@@ -1596,7 +1597,38 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- typed messages ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    await handle_text(update, ctx, update.message.text)
+
+
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """A voice message: write it down, then fill it in like typed text."""
+    set_lang(ctx)
+    msg = update.message
+    voice = msg.voice or msg.audio or msg.video_note
+    if voice is None:
+        return
+    await tidy(msg)
+    clear_files_later(ctx)
+    try:
+        raw = bytes(await (await voice.get_file()).download_as_bytearray())
+    except Exception:
+        return await flash(ctx, tr("voice_fail"))
+    if len(raw) > speech.MAX_VOICE:
+        return await flash(ctx, tr("voice_too_big"))
+    tmp = os.path.join(tempfile.gettempdir(), f"voice_{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}.ogg")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        text = speech.transcribe(tmp)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    if not text:
+        return await flash(ctx, tr("voice_unclear"))
+    await handle_text(update, ctx, speech.spoken_numbers(text))
+
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text):
     set_lang(ctx)
     if text.strip() in SHORTCUT_TEXTS:                      # the buttons at the bottom
         return await {"📝 Today": today_cmd, "📚 History": history_cmd, "📊 Month": month_cmd}[text.strip()](update, ctx)
@@ -1957,6 +1989,7 @@ def build_app():
     app.add_handler(CommandHandler("lang", lang_cmd, filters=only_me))
     app.add_handler(MessageHandler(only_me & filters.COMMAND, unknown_cmd))     # any other command
     app.add_handler(MessageHandler(only_me & filters.Document.ALL, on_document))
+    app.add_handler(MessageHandler(only_me & (filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE), on_voice))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

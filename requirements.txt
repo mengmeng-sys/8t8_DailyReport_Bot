@@ -3,3 +3,4 @@ openpyxl
 lxml
 python-dotenv
 tzdata
+faster-whisper

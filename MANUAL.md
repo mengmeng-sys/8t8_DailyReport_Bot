@@ -1,4 +1,26 @@
-# MANUAL.md - Storage, drafts, Undo and language
+# MANUAL.md - Storage, drafts, Undo, language and voice
+
+## Voice input (type or say)
+
+You can fill the report by **typing** or by **talking**. Send a voice message and the
+bot writes down what you say and fills it in — with the same checks as typing
+(the "did you type an extra digit?" warning, the same flow).
+
+- Say: `pool forty zero twenty` → Pool view cash 40, card 0, aba 20
+- Say: `bar fifty ten five` → Bar 50 / 10 / 5
+- Say: `water twelve` → an expense "water" for 12
+- Say: `discount five long stay` → a discount of 5
+
+Spoken numbers are turned into digits: `forty` → 40, `oh`/`zero` → 0,
+`twenty one` → 21, `fifty ten five` → 50, 10, 5.
+
+**Setup (one time):** `pip install faster-whisper` (already in
+`requirements.txt`). The first voice message downloads a small model (~150 MB,
+model `base` by default). Set `STT_MODEL=tiny` in `.env` for a smaller/faster
+model. The model is cached in `DATA_DIR/models`, so it stays on the persistent
+disk on Render. It works offline and costs nothing.
+
+If the bot cannot understand you, it says so and asks you to repeat or type.
 
 ## 0. Language (KH / EN)
 

@@ -1,8 +1,8 @@
 # bot.py - Telegram bot: clean aligned screens, step-by-step entry, review before sending,
 # always-visible shortcuts, History (open / update / delete), chat cleans itself.
-import asyncio, copy, html, logging, os, re, tempfile
+import asyncio, calendar, copy, html, logging, os, re, tempfile, zlib
 from datetime import datetime, time
-from time import perf_counter
+from time import monotonic, perf_counter
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -10,22 +10,26 @@ from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, Defaults,
                           MessageHandler, PicklePersistence, filters)
 from telegram.request import HTTPXRequest
 
 import history
+import monthly
 from fill import fill_template, summarize
 from reader import parse as parse_rules, _split as split_item
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+for noisy in ("httpx", "httpcore"):          # these lines would print your bot token in the log
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER = int(os.environ["TELEGRAM_CHAT_ID"])  # only you can use the bot
 TZ = ZoneInfo("Asia/Phnom_Penh")
 PAGE = 8  # reports per page in History
+VERSION = "2026-10-31 month+backup+quick-expenses"   # shown in /ping and in the log, to see which file runs
 
 
 def reminder_time():
@@ -57,10 +61,10 @@ TITLES = {"rooms": "🛏 Rooms", "tours": "🧳 Tours"}
 STEPS = ([("item", "rooms", k) for k in LABELS["rooms"]] + [("item", "tours", k) for k in LABELS["tours"]]
          + [("bar",), ("discount",), ("expense",)])
 
-SHORTCUTS = ReplyKeyboardMarkup([[KeyboardButton("📝 Today"), KeyboardButton("📚 History")]],
+SHORTCUTS = ReplyKeyboardMarkup([[KeyboardButton("📝 Today"), KeyboardButton("📚 History"), KeyboardButton("📊 Month")]],
                                 resize_keyboard=True, is_persistent=True,
                                 input_field_placeholder="Tap a button, or type numbers")
-SHORTCUT_TEXTS = ("📝 Today", "📚 History")
+SHORTCUT_TEXTS = ("📝 Today", "📚 History", "📊 Month")
 
 
 # ---------- small helpers ----------
@@ -82,7 +86,7 @@ def file_name(iso):                # 2026-10-26 -> 26-10-2026_Report.xlsx
 
 
 def fresh():
-    return {"rooms": {}, "tours": {}, "bar": [], "discount": {}, "expenses": []}
+    return {"rooms": {}, "tours": {}, "bar": [], "discount": {}, "expenses": [], "cash_check": {}}
 
 
 def complete(data):
@@ -146,7 +150,7 @@ def start_session(ctx, iso, explicit=False):
         "date": iso, "explicit": explicit, "saved": saved is not None,
         "data": complete(copy.deepcopy(saved)) if saved else fresh(),
     }
-    for k in ("waiting", "guided", "pending", "pad"):
+    for k in ("waiting", "guided", "pending", "pad", "cash_ui"):
         ctx.user_data.pop(k, None)
     return ctx.user_data["session"]
 
@@ -193,8 +197,10 @@ def report_body(data, iso, title):
     if d.get("amount"):
         parts.append(f"🏷 Discount {n(d['amount'])}" + (f" · {esc(d['reason'])}" if d.get("reason") else ""))
     if data["expenses"]:
-        items = "\n".join(f"{e['name']}: {n(e['amount'])}" for e in data["expenses"])
+        items = "\n".join(f"{e['name']}: {n(e['amount'])}" + ("" if e.get("cash", True) else " (not from cash drawer)")
+                          for e in data["expenses"])
         parts += [f"💸 Expenses {n(sm['expenses'])}", f"<pre>{esc(items)}</pre>"]
+    parts += cash_lines(data)
     return "\n".join(parts)
 
 
@@ -207,7 +213,8 @@ def home_screen():
     start = "✏️ Update today's report" if saved else "▶️ Start today's report"
     return text, Markup([
         [Btn(start, callback_data="new")],
-        [Btn("📚 History", callback_data="hist:0"), Btn("📅 Other date", callback_data="newdate")],
+        [Btn("📚 History", callback_data="hist:0"), Btn("📊 Month", callback_data="mon:cur")],
+        [Btn("📅 Other date", callback_data="newdate")],
     ])
 
 
@@ -223,6 +230,8 @@ def report_screen(s, note=""):
         f"{'Expenses':<10}{len(data['expenses'])} item(s) · {n(sm['expenses'])}" if data["expenses"]
         else f"{'Expenses':<10}-",
     ]
+    cf = cash_figures(data)
+    rows.append(f"{'Cash':<10}" + (f"{cash_status(cf).replace('⚠️ ', '').replace('✅ ', '')}" if cf["has"] else "not counted"))
     cash, card, aba = method_totals(data)
     text = ((esc(note) + "\n\n") if note else "") + (
         f"<b>🏨 HOSTEL REPORT</b> · {dmy(s['date'])}\n<i>{mode}</i>\n\n"
@@ -234,7 +243,7 @@ def report_screen(s, note=""):
         [Btn("🛏 Rooms", callback_data="m:rooms"), Btn("🧳 Tours", callback_data="m:tours"),
          Btn("🍽 Bar", callback_data="in:bar")],
         [Btn("🏷 Discount", callback_data="in:discount"), Btn("💸 Expenses", callback_data="in:expense")],
-        [Btn("📋 Review & finish", callback_data="review")],
+        [Btn("💵 Cash check", callback_data="cash:main"), Btn("📋 Review & finish", callback_data="review")],
         [Btn("🏠 Home", callback_data="home"), Btn("🗑 Clear all", callback_data="act:reset")],
     ])
 
@@ -262,16 +271,88 @@ def discount_prompt(note=""):
 
 def expense_lines(s):
     items = s["data"]["expenses"]
-    lines = [f"{i}. {esc(e['name'])}: {n(e['amount'])}" for i, e in enumerate(items, 1)] or ["<i>(none yet)</i>"]
+    lines = [f"{i}. {esc(e['name'])}: {n(e['amount'])}" + ("" if e.get("cash", True) else " 🚫 not from drawer")
+             for i, e in enumerate(items, 1)] or ["<i>(none yet)</i>"]
     return lines + ["", f"Total: <b>{n(sum(e['amount'] for e in items))}</b>"]
+
+
+def name_key(name):
+    return zlib.crc32(str(name).strip().lower().encode()) & 0xFFFF
+
+
+def frequent_expenses(s, limit=6):
+    """Your usual expenses, learned from your past reports: (name, newest amount), most used first."""
+    have = {str(e.get("name", "")).strip().lower() for e in s["data"]["expenses"]}
+    seen = {}
+    for iso in previous_isos(s)[:60]:                       # newest first
+        for e in (history.load_report(iso) or {}).get("expenses") or []:
+            key = str(e.get("name", "")).strip().lower()
+            if key and key not in have:
+                rec = seen.setdefault(key, {"name": str(e["name"]).strip(), "amount": e.get("amount", 0), "count": 0})
+                rec["count"] += 1                          # the amount stays the newest one
+    ranked = sorted(seen.values(), key=lambda r: -r["count"])
+    return [(r["name"], r["amount"]) for r in ranked[:limit]]
+
+
+def last_expenses(s):
+    """The newest earlier report that has expenses: (date, list), or (None, [])."""
+    for iso in previous_isos(s)[:60]:
+        old = (history.load_report(iso) or {}).get("expenses") or []
+        if old:
+            return iso, old
+    return None, []
+
+
+def quick_expense_rows(s):
+    """Buttons: your usual expenses, and 'same as the last report'."""
+    btns = [Btn(f"➕ {name[:16]} {n(amt)}", callback_data=f"exp:q:{i}:{name_key(name)}")
+            for i, (name, amt) in enumerate(frequent_expenses(s))]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    iso, old = last_expenses(s)
+    if iso and not s["data"]["expenses"]:
+        rows.append([Btn(f"📋 Same as {dmy(iso)[:5]} ({len(old)} item{'s' if len(old) != 1 else ''})", callback_data="exp:yday")])
+    return rows
 
 
 def expense_screen(s, note=""):
     items = s["data"]["expenses"]
+    quick = quick_expense_rows(s)
     lines = ([esc(note), ""] if note else []) + ["<b>💸 Expenses</b>", ""] + expense_lines(s) + [
         "", "Type the next one: name then amount", "Example: <code>water 12</code>"]
-    row = ([Btn("↩️ Undo last", callback_data="exp:undo")] if items else []) + [Btn("✅ Done", callback_data="m:main")]
-    return "\n".join(lines), Markup([row])
+    if quick:
+        lines.append("Or tap one of your usual expenses 👇")
+    row = ([Btn("↩️ Undo last", callback_data="exp:undo"), Btn("✏️ Edit list", callback_data="exp:list:main")]
+           if items else []) + [Btn("✅ Done", callback_data="m:main")]
+    return "\n".join(lines), Markup(quick + [row])
+
+
+# ---------- edit the expenses: change a name or amount, delete one, say it was NOT paid from the drawer ----------
+def expense_list_screen(s, note=""):
+    items = s["data"]["expenses"]
+    lines = ([esc(note), ""] if note else []) + ["<b>✏️ Edit expenses</b>", ""]
+    lines += expense_lines(s)[:-2] if items else ["<i>(none yet)</i>"]
+    if items:
+        drawer = sum(e["amount"] for e in items if e.get("cash", True))
+        lines += ["", f"Total: <b>{n(sum(e['amount'] for e in items))}</b> · from the cash drawer: <b>{n(drawer)}</b>"]
+    lines += ["", "Tap an expense to change it."]
+    rows = [[Btn(f"{i}. {e['name'][:20]} · {n(e['amount'])}" + ("" if e.get("cash", True) else " 🚫"),
+                 callback_data=f"exp:item:{i - 1}")] for i, e in enumerate(items, 1)]
+    rows.append([Btn("⬅️ Back", callback_data="exp:back")])
+    return "\n".join(lines), Markup(rows)
+
+
+def expense_item_screen(s, idx, note=""):
+    e = s["data"]["expenses"][idx]
+    cash = e.get("cash", True)
+    lines = ([esc(note), ""] if note else []) + [
+        f"<b>Expense {idx + 1}</b>", "", f"Name: <b>{esc(e['name'])}</b>", f"Amount: <b>{n(e['amount'])}</b>",
+        "Paid from the cash drawer: " + ("✅ yes" if cash else "🚫 no (not counted in the cash check)")]
+    return "\n".join(lines), Markup([
+        [Btn("✏️ Name", callback_data=f"exp:ename:{idx}"), Btn("💲 Amount", callback_data=f"exp:eamt:{idx}")],
+        [Btn("🚫 Not from the drawer - tap to change" if not cash else "💵 From the drawer ✅ - tap to change",
+             callback_data=f"exp:tog:{idx}")],
+        [Btn("🗑 Delete", callback_data=f"exp:delq:{idx}"), Btn("⬅️ Back", callback_data="exp:list:keep")],
+    ])
 
 
 def step_screen(s, idx, note=""):
@@ -296,7 +377,12 @@ def step_screen(s, idx, note=""):
         nav.append(Btn("⏭ Skip", callback_data="g:next"))
     if idx > 0:
         nav.append(Btn("⬅️ Back", callback_data="g:back"))
-    return "\n".join(lines), Markup([nav, [Btn("☰ Menu", callback_data="g:stop")]])
+    second = ([Btn("✏️ Edit list", callback_data="exp:list:guided")] if step[0] == "expense" and data["expenses"] else []) \
+        + [Btn("☰ Menu", callback_data="g:stop")]
+    quick = quick_expense_rows(s) if step[0] == "expense" else []
+    if quick:
+        lines.append("Or tap one of your usual expenses 👇")
+    return "\n".join(lines), Markup(quick + [nav, second])
 
 
 # ---------- the number keypad (for a room, a tour or the bar: cash / card / aba) ----------
@@ -407,11 +493,36 @@ def review_screen(s, note=""):
     empty = not any(sum(three(v)) for grp in ("rooms", "tours") for v in data[grp].values()) \
         and not sum(three(data["bar"])) and not data["expenses"]
     text = ((esc(note) + "\n\n") if note else "") + report_body(data, s["date"], "📋 REVIEW")
+    cmp = compare_lines(s)
+    text += ("\n" + "\n".join(cmp) if cmp else "")
     text += ("\n\n⚠️ The report is empty." if empty else "") + "\n\nIs everything correct?"
     return text, Markup([
         [Btn("✅ Confirm - send me the xlsx", callback_data="act:generate")],
-        [Btn("✏️ Fix something", callback_data="m:main")],
+        [Btn("💵 Cash check", callback_data="cash:review"), Btn("✏️ Fix something", callback_data="m:main")],
     ])
+
+
+def previous_isos(s):
+    """Days with a saved report before this one, newest first."""
+    return [i for i in history.list_reports() if i < s["date"]]
+
+
+def compare_lines(s):
+    """How today's revenue compares with the last report and with the last 7 days."""
+    cur = summarize(s["data"])["total"]
+    prev = previous_isos(s)[:7]
+    if not cur or not prev:
+        return []
+    vals = [summarize(complete(history.load_report(i) or {}))["total"] for i in prev]
+    out = []
+    if vals[0]:
+        p = (cur - vals[0]) / vals[0] * 100
+        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% vs {dmy(prev[0])[:5]} ({n(vals[0])})")
+    if len(vals) >= 3 and sum(vals) > 0:
+        avg = sum(vals) / len(vals)
+        p = (cur - avg) / avg * 100
+        out.append(f"{'📈' if p >= 0 else '📉'} {p:+.0f}% vs the average of the last {len(vals)} days ({n(avg)})")
+    return out
 
 
 def done_screen(s):
@@ -436,7 +547,7 @@ def history_screen(page, note=""):
                 Markup([[Btn("▶️ Start today's report", callback_data="new"), Btn("🏠 Home", callback_data="home")]]))
     pages = (len(items) + PAGE - 1) // PAGE
     page = max(0, min(page, pages - 1))
-    rows = []
+    rows = [[Btn("📊 Month summary", callback_data="mon:cur")]]
     for iso in items[page * PAGE:(page + 1) * PAGE]:
         data = history.load_report(iso)
         total = summarize(complete(data))["total"] if data else 0
@@ -463,6 +574,153 @@ def report_view_markup(iso):
 
 def report_view(data, iso):
     return report_body(complete(data), iso, "📋 REPORT"), report_view_markup(iso)
+
+
+# ---------- cash check: what the drawer should hold, and what you counted (dollars) ----------
+USD_NOTES = [100, 50, 20, 10, 5, 2, 1]
+
+
+def sgn(v):
+    v = round(float(v), 2)
+    return f"+{n(v)}" if v > 0 else n(v)
+
+
+def cash_figures(data):
+    cc = data.get("cash_check") or {}
+    notes = (cc.get("counts") or {}).get("usd") or {}
+    counted_notes = sum(int(d) * c for d, c in notes.items())
+    typed = cc.get("typed")
+    counted = float(typed) if typed is not None else float(counted_notes)
+    cash_rev = method_totals(data)[0]
+    all_exp = sum(float(e.get("amount") or 0) for e in data.get("expenses") or [])
+    expenses = sum(float(e.get("amount") or 0) for e in data.get("expenses") or [] if e.get("cash", True))
+    opening = float(cc.get("opening") or 0)
+    expected = opening + cash_rev - expenses
+    return {"typed": typed, "counted": counted, "has": typed is not None or bool(counted_notes),
+            "cash_rev": cash_rev, "expenses": expenses, "other_expenses": round(all_exp - expenses, 2),
+            "opening": opening, "expected": expected, "diff": round(counted - expected, 2)}
+
+
+def cash_status(f):
+    if not f["has"]:
+        return ""
+    if abs(f["diff"]) < 0.005:
+        return "✅ matches"
+    return f"⚠️ SHORT {n(-f['diff'])}" if f["diff"] < 0 else f"⚠️ OVER {n(f['diff'])}"
+
+
+def cash_screen(ctx, s, note=""):
+    data = s["data"]
+    step = (ctx.user_data.get("cash_ui") or {}).get("step", 1)
+    f = cash_figures(data)
+    rows = [("Cash revenue", n(f["cash_rev"])), ("Expenses", "-" + n(f["expenses"]))]
+    if f["opening"]:
+        rows.append(("Opening cash", n(f["opening"])))
+    rows += [("Expected", n(f["expected"])), ("Counted", n(f["counted"]) if f["has"] else "-")]
+    if f["has"]:
+        rows.append(("Difference", sgn(f["diff"])))
+    lines = ([esc(note), ""] if note else []) + [
+        f"<b>💵 CASH CHECK</b> · {dmy(s['date'])}", "",
+        "<pre>" + esc("\n".join(f"{a:<14}{b:>10}" for a, b in rows)) + "</pre>"]
+    if f["has"]:
+        lines.append(f"<b>{cash_status(f)}</b>")
+        if f["typed"] is not None:
+            lines.append("<i>(you typed the total)</i>")
+    if f["other_expenses"]:
+        lines.append(f"🚫 Not from the drawer: {n(f['other_expenses'])} (not counted)")
+    lines += ["", "Expenses count as paid from the drawer, unless you mark them 🚫.",
+              "Tap ➕ / ➖ for each note. Step = how many notes per tap."]
+    counts = ((data.get("cash_check") or {}).get("counts") or {}).get("usd", {})
+    rows_b = [[Btn(("▸ " if step == x else "") + f"Step {x}", callback_data=f"c:step:{x}") for x in (1, 5, 10)]]
+    for d in USD_NOTES:
+        rows_b.append([Btn("➖", callback_data=f"c:-:{d}"),
+                       Btn(f"${d} ×{counts.get(str(d), 0)}", callback_data="c:noop"),
+                       Btn("➕", callback_data=f"c:+:{d}")])
+    rows_b.append([Btn("⌨️ Type total", callback_data="c:total"), Btn("🏁 Opening cash", callback_data="c:open")])
+    rows_b.append([Btn("💸 Edit expenses", callback_data="exp:list:cash")])
+    rows_b.append([Btn("🧹 Reset count", callback_data="c:reset"), Btn("✅ Done", callback_data="c:done")])
+    return "\n".join(lines), Markup(rows_b)
+
+
+def cash_change(ctx, s, cmd):
+    """One tap on the cash screen. Returns True if the screen needs to be drawn again."""
+    ui = ctx.user_data.setdefault("cash_ui", {"step": 1})
+    cc = s["data"].setdefault("cash_check", {})
+    parts = cmd.split(":")                       # c:+:20  |  c:-:5  |  c:step:5  |  c:reset
+    if parts[1] in ("+", "-") and parts[2].isdigit():
+        counts = cc.setdefault("counts", {}).setdefault("usd", {})
+        step = ui.get("step", 1) if parts[1] == "+" else -ui.get("step", 1)
+        counts[parts[2]] = max(0, counts.get(parts[2], 0) + step)
+        cc["typed"] = None                       # counting notes replaces a typed total
+        return True
+    if parts[1] == "step" and parts[2].isdigit():
+        ui["step"] = int(parts[2])
+        return True
+    if parts[1] == "reset":
+        cc["counts"], cc["typed"] = {}, None
+        return True
+    return False
+
+
+def cash_lines(data):
+    f = cash_figures(data)
+    if not f["has"]:
+        return []
+    return [f"💵 Cash check: expected {n(f['expected'])} · counted {n(f['counted'])} · {cash_status(f)}"]
+
+
+# ---------- month summary ----------
+def day_row(iso, data):
+    d = complete(data)
+    sm, (cash, card, aba), cf = summarize(d), method_totals(d), cash_figures(d)
+    return {"date": datetime.strptime(iso, "%Y-%m-%d").date(), "rooms": sm["rooms"], "tours": sm["tours"],
+            "bar": sm["bar"], "cash": cash, "card": card, "aba": aba, "expenses": sm["expenses"],
+            "counted": cf["counted"] if cf["has"] else None, "diff": cf["diff"] if cf["has"] else None}
+
+
+def month_rows(ym):
+    rows = []
+    for iso in sorted(i for i in history.list_reports() if i.startswith(ym)):
+        data = history.load_report(iso)
+        if data:
+            rows.append(day_row(iso, data))
+    return rows
+
+
+def shift_month(ym, k):
+    y, m = int(ym[:4]), int(ym[5:7]) + k
+    return f"{y + (m - 1) // 12:04d}-{(m - 1) % 12 + 1:02d}"
+
+
+def month_title(ym):
+    return f"{calendar.month_name[int(ym[5:7])]} {ym[:4]}"
+
+
+def month_screen(ym, note=""):
+    rows = month_rows(ym)
+    st = monthly.stats(rows)
+    prev_, next_ = shift_month(ym, -1), shift_month(ym, 1)
+    nav = [Btn(f"⬅️ {calendar.month_abbr[int(prev_[5:7])]}", callback_data=f"mon:{prev_}")]
+    if next_ <= today_iso()[:7]:
+        nav.append(Btn(f"{calendar.month_abbr[int(next_[5:7])]} ➡️", callback_data=f"mon:{next_}"))
+    foot = [Btn("📚 History", callback_data="hist:0"), Btn("🏠 Home", callback_data="home")]
+    head = ((esc(note) + "\n\n") if note else "") + f"<b>📊 {month_title(ym).upper()}</b>"
+    if not st:
+        return head + "\n\nNo reports in this month yet.", Markup([nav, foot])
+    sd = lambda d: d.strftime("%d/%m")
+    lines = [head + f" · {st['days']} day{'s' if st['days'] != 1 else ''}", "",
+             f"<pre>{'':<10}{'CASH':>9}{'CARD':>9}{'ABA':>9}\n{'Revenue':<10}{n(st['cash']):>9}{n(st['card']):>9}{n(st['aba']):>9}</pre>",
+             f"💰 Revenue <b>{n(st['revenue'])}</b>",
+             f"   🛏 Rooms {n(st['rooms'])} · 🧳 Tours {n(st['tours'])} · 🍽 Bar {n(st['bar'])}",
+             f"💸 Expenses {n(st['expenses'])}",
+             f"📈 Net (revenue − expenses) <b>{n(st['net'])}</b>",
+             f"📅 Average {n(st['avg'])} per day",
+             f"⭐ Best day {sd(st['best'][0])}: {n(st['best'][1])}"]
+    if st["days"] > 1:
+        lines.append(f"🔻 Lowest day {sd(st['worst'][0])}: {n(st['worst'][1])}")
+    if st["counted_days"]:
+        lines.append(f"💵 Cash check: {st['counted_days']} day(s) counted · short {n(-st['short'])} · over {n(st['over'])}")
+    return "\n".join(lines), Markup([nav, [Btn("📥 Month xlsx", callback_data=f"monx:{ym}")], foot])
 
 
 # ---------- mistake warning: a number far bigger than your past reports ----------
@@ -613,6 +871,16 @@ async def delete_messages(ctx, ids):
             pass
 
 
+async def flash(ctx, text, seconds=8):
+    """A short message that removes itself, so answers to commands do not fill the chat."""
+    msg = await ctx.bot.send_message(OWNER, text)
+
+    async def later():
+        await asyncio.sleep(seconds)
+        await delete_messages(ctx, [msg.message_id])
+    background(later())
+
+
 def clear_files_later(ctx):
     """Take the xlsx files the bot sent out of the chat (they stay in History)."""
     ids = ctx.user_data.pop("files", [])
@@ -631,6 +899,22 @@ async def send_report(ctx, data, iso):
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+
+async def deliver_path(ctx, path, filename, screen, old_panel_id):
+    """Like deliver_file, for any file on disk (the month xlsx)."""
+    clear_files_later(ctx)
+    try:
+        with open(path, "rb") as f:
+            msg = await ctx.bot.send_document(OWNER, f, filename=filename)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    ctx.user_data.setdefault("files", []).append(msg.message_id)
+    panel = await ctx.bot.send_message(OWNER, screen[0], reply_markup=screen[1])
+    ctx.user_data["panel"] = panel.message_id
+    if old_panel_id:
+        background(delete_messages(ctx, [old_panel_id]))
 
 
 async def deliver_file(ctx, data, iso, screen, old_panel_id):
@@ -667,6 +951,10 @@ async def today_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await open_panel(update, ctx, history_screen(0))
+
+
+async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await open_panel(update, ctx, month_screen(today_iso()[:7]))
 
 
 async def keyboard_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -714,6 +1002,18 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cmd.startswith("hist:"):
         ctx.user_data.pop("waiting", None)
         return await show(q, history_screen(int(cmd.split(":")[1])))
+    if cmd.startswith("mon:"):
+        ctx.user_data.pop("waiting", None)
+        ym = today_iso()[:7] if cmd[4:] == "cur" else cmd[4:]
+        return await show(q, month_screen(ym))
+    if cmd.startswith("monx:"):
+        ym = cmd[5:]
+        rows = month_rows(ym)
+        if not rows:
+            return await show(q, month_screen(ym, "No reports in that month."))
+        path = os.path.join(tempfile.gettempdir(), f"month_{ym}.xlsx")
+        monthly.build_xlsx(path, month_title(ym), rows)
+        return await deliver_path(ctx, path, f"{ym[5:7]}-{ym[:4]}_Month_Report.xlsx", month_screen(ym), q.message.message_id)
     if cmd.startswith("h:"):
         _, action, iso = cmd.split(":", 2)
         data = history.load_report(iso)
@@ -767,6 +1067,33 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show(q, pad_screen(ctx, s))
         else:
             await show(q, report_screen(s))
+    elif cmd.startswith("cash:"):                           # open the cash check
+        ctx.user_data.pop("waiting", None)
+        ctx.user_data["cash_ui"] = {"step": 1, "from": cmd.split(":")[1]}
+        await show(q, cash_screen(ctx, s))
+    elif cmd.startswith("c:"):                              # a tap on the cash check screen
+        ui = ctx.user_data.setdefault("cash_ui", {"step": 1})
+        what = cmd.split(":")[1]
+        if what == "noop":
+            return
+        if what == "done":
+            ctx.user_data.pop("waiting", None)
+            return await show(q, review_screen(s) if ui.get("from") == "review" else report_screen(s))
+        if what in ("total", "open"):
+            ctx.user_data["waiting"] = ({"total": ("cash_total",), "open": ("cash_open",)})[what]
+            title, example, extra = {
+                "total": ("💵 Total cash counted", "160", "The total in dollars you counted\n"),
+                "open": ("🏁 Opening cash", "50", "Cash that was in the drawer before today's sales\n(0 if you take everything out each day)\n")}[what]
+            return await show(q, prompt_screen(title, example, "c:back", extra=extra))
+        if what == "back":
+            ctx.user_data.pop("waiting", None)
+            return await show(q, cash_screen(ctx, s))
+        if cash_change(ctx, s, cmd):
+            ui["v"] = ui.get("v", 0) + 1
+            async with pad_lock():                          # fast taps: draw only the newest numbers
+                if ctx.user_data.get("cash_ui") is ui and ui.get("shown") != ui["v"] and not ctx.user_data.get("waiting"):
+                    ui["shown"] = ui["v"]
+                    await show(q, cash_screen(ctx, s))
     elif cmd.startswith("k:"):                              # a key on the keypad
         w, pad = ctx.user_data.get("waiting"), ctx.user_data.get("pad")
         if not pad or not w or w[0] not in ("item", "bar"):   # e.g. a double tap after Save: do nothing
@@ -812,6 +1139,62 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             note = f"↩️ Removed {gone['name']}: {n(gone['amount'])}"
         ctx.user_data["waiting"] = ("expense",)
         await show(q, expense_view(ctx, s, note))
+    elif cmd.startswith("exp:") and cmd != "exp:undo":      # edit the expenses
+        parts = cmd.split(":")
+        what, arg = parts[1], (parts[2] if len(parts) > 2 else "")
+        items = data["expenses"]
+        if what == "list":
+            if arg != "keep":
+                ctx.user_data["exp_from"] = arg            # where Back goes: cash | main | guided
+            ctx.user_data.pop("waiting", None)
+            return await show(q, expense_list_screen(s))
+        if what == "back":
+            src = ctx.user_data.get("exp_from", "main")
+            ctx.user_data.pop("waiting", None)
+            if src == "cash":
+                ctx.user_data.setdefault("cash_ui", {"step": 1})
+                return await show(q, cash_screen(ctx, s))
+            ctx.user_data["waiting"] = ("expense",)
+            return await show(q, expense_view(ctx, s) if src == "guided" else expense_screen(s))
+        if what in ("q", "yday"):                           # quick expenses
+            ctx.user_data["waiting"] = ("expense",)
+            note = ""
+            if what == "q":
+                freq = frequent_expenses(s)
+                k = int(arg) if arg.isdigit() else -1
+                if 0 <= k < len(freq) and (len(parts) < 4 or str(name_key(freq[k][0])) == parts[3]):
+                    items.append({"name": freq[k][0], "amount": freq[k][1]})
+                    note = f"✅ Added {freq[k][0]}: {n(freq[k][1])} (tap ✏️ Edit list to change the amount)"
+                else:
+                    note = "That list changed. Please tap again."
+            else:
+                iso, old = last_expenses(s)
+                if old and not items:
+                    items.extend(copy.deepcopy(old))
+                    note = f"✅ Added {len(old)} expense{'s' if len(old) != 1 else ''} from {dmy(iso)[:5]}"
+            return await show(q, expense_view(ctx, s, note))
+        i = int(arg) if arg.isdigit() else -1
+        if not 0 <= i < len(items):                         # the list changed: show it again
+            return await show(q, expense_list_screen(s, "That expense is not there any more."))
+        ctx.user_data.pop("waiting", None)
+        if what == "item":
+            await show(q, expense_item_screen(s, i))
+        elif what == "tog":
+            items[i]["cash"] = not items[i].get("cash", True)
+            await show(q, expense_item_screen(s, i, "✅ Changed"))
+        elif what in ("ename", "eamt"):
+            ctx.user_data["waiting"] = ("exp_name" if what == "ename" else "exp_amount", i)
+            await show(q, prompt_screen("✏️ New name" if what == "ename" else "💲 New amount",
+                                        "tea" if what == "ename" else "12", f"exp:item:{i}",
+                                        extra=f"Now: {esc(items[i]['name']) if what == 'ename' else n(items[i]['amount'])}\n"))
+        elif what == "delq":
+            e = items[i]
+            await show(q, (f"🗑 <b>Delete this expense?</b>\n{esc(e['name'])}: {n(e['amount'])}",
+                           Markup([[Btn("Yes, delete", callback_data=f"exp:delyes:{i}"),
+                                    Btn("Cancel", callback_data=f"exp:item:{i}")]])))
+        elif what == "delyes":
+            gone = items.pop(i)
+            await show(q, expense_list_screen(s, f"🗑 Deleted {gone['name']}: {n(gone['amount'])}"))
     elif cmd == "act:reset":
         await show(q, ("🗑 <b>Clear all numbers of this report?</b>\n(History is not changed.)",
                        Markup([[Btn("Yes, clear", callback_data="act:resety"),
@@ -836,8 +1219,8 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- typed messages ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if text.strip() in SHORTCUT_TEXTS:                      # the two buttons at the bottom
-        return await (today_cmd if text.strip() == "📝 Today" else history_cmd)(update, ctx)
+    if text.strip() in SHORTCUT_TEXTS:                      # the buttons at the bottom
+        return await {"📝 Today": today_cmd, "📚 History": history_cmd, "📊 Month": month_cmd}[text.strip()](update, ctx)
     w = ctx.user_data.get("waiting")
     clear_files_later(ctx)
 
@@ -877,6 +1260,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await respond(update, ctx, pad_screen(ctx, s, "⚠️ Please type numbers, or use the keypad."))
         await respond(update, ctx, submit_numbers(ctx, s, nums))
 
+    elif w[0] in ("exp_name", "exp_amount"):
+        _, i = w
+        items = data["expenses"]
+        if not 0 <= i < len(items):
+            ctx.user_data.pop("waiting", None)
+            return await respond(update, ctx, expense_list_screen(s, "That expense is not there any more."))
+        if w[0] == "exp_name":
+            name = text.strip()[:40]
+            if not name:
+                return await respond(update, ctx, prompt_screen("✏️ New name", "tea", f"exp:item:{i}", "⚠️ Please type a name."))
+            items[i]["name"] = name
+        else:
+            nums = numbers(text)
+            if not nums or nums[0] < 0:
+                return await respond(update, ctx, prompt_screen("💲 New amount", "12", f"exp:item:{i}",
+                                                                "⚠️ Please type a number (not negative)."))
+            items[i]["amount"] = nums[0]
+        ctx.user_data.pop("waiting", None)
+        await respond(update, ctx, expense_item_screen(s, i, "✅ Saved"))
+
+    elif w[0] in ("cash_total", "cash_open"):
+        nums = numbers(text)
+        if not nums or nums[0] < 0:
+            return await respond(update, ctx, prompt_screen("💵 Cash check", "160", "c:back",
+                                                            "⚠️ Please type a number (not negative)."))
+        cc = data.setdefault("cash_check", {})
+        if w[0] == "cash_total":
+            cc["typed"] = nums[0]
+            note = f"✅ Counted total: {n(nums[0])}"
+        else:
+            cc["opening"] = nums[0]
+            note = f"✅ Opening cash: {n(nums[0])}"
+        ctx.user_data.pop("waiting", None)
+        ctx.user_data.setdefault("cash_ui", {"step": 1})
+        await respond(update, ctx, cash_screen(ctx, s, note))
+
     elif w[0] == "discount":
         _, nums, rest = split_item(text)
         if not nums:
@@ -905,6 +1324,123 @@ async def reminder(ctx: ContextTypes.DEFAULT_TYPE):
     ud["panel"] = msg.message_id
 
 
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Short, clear messages instead of long error traces."""
+    err = ctx.error
+    if isinstance(err, Conflict):      # Telegram: two copies of this bot are asking for messages
+        last = ctx.application.bot_data.get("conflict_at", -1e9)
+        if monotonic() - last > 3600:  # warn at most once an hour
+            ctx.application.bot_data["conflict_at"] = monotonic()
+            logging.error("CONFLICT: another copy of this bot is running (Render, another terminal, "
+                          "another computer). Stop the other copy, or the buttons will act strangely.")
+            try:
+                await ctx.bot.send_message(OWNER, "⚠️ Another copy of this bot is running somewhere "
+                                                  "(Render, another terminal or another computer).\n"
+                                                  "Stop it, or the buttons can act strangely "
+                                                  "(for example a number going to the wrong field).")
+            except Exception:
+                pass
+        return
+    if isinstance(err, NetworkError):  # includes TimedOut: the internet is slow, it tries again by itself
+        logging.warning("Network problem (the bot tries again): %s", err)
+        return
+    logging.error("Unexpected error", exc_info=err)
+
+
+async def keep_warm(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every 40 seconds: two tiny requests keep two connections to Telegram ready (one for the edit,
+    one for the button answer). It also tells you in the log if Telegram is slow."""
+    t0 = perf_counter()
+    try:
+        await asyncio.gather(ctx.bot.get_me(), ctx.bot.get_me())
+    except Exception as e:
+        logging.warning("Keep-warm request failed (%s)", e)
+        return
+    took = perf_counter() - t0
+    ctx.application.bot_data["ping"] = took
+    if took > 1.5:
+        logging.warning("Telegram is slow right now: %.1fs for a tiny request. This is your internet or Telegram, "
+                        "not the bot.", took)
+
+
+def self_url():
+    """The public address of this bot on Render (Render sets RENDER_EXTERNAL_URL). Or write SELF_URL in .env."""
+    return (os.getenv("SELF_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+
+async def self_ping(ctx: ContextTypes.DEFAULT_TYPE):
+    """On Render: the bot visits its own public address, so Render sees traffic and does not put it to sleep.
+    (Asking localhost would not count: the visit must come in from outside.)"""
+    url = self_url()
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(url + "/")
+        if r.status_code >= 400:
+            logging.warning("Self-ping got HTTP %s from %s", r.status_code, url)
+    except Exception as e:
+        logging.warning("Self-ping failed (%s)", e)
+
+
+async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/ping: how fast is the line between the bot and Telegram?"""
+    t0 = perf_counter()
+    await ctx.bot.get_me()
+    took = perf_counter() - t0
+    verdict = "fast ✅" if took < 0.6 else ("OK" if took < 1.5 else "slow ⚠️ (check your internet or VPN)")
+    await asyncio.gather(tidy(update), flash(
+        ctx, f"🏓 Pong! Bot ↔ Telegram: <b>{took:.2f} s</b> · {verdict}\n<i>version {VERSION}</i>", seconds=10))
+
+
+async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await asyncio.gather(tidy(update), flash(ctx, "I do not know that command. Send /start for the menu.", seconds=6))
+
+
+async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/backup: all your reports in one zip file."""
+    raw, count = history.backup_zip()
+    await tidy(update)
+    if not count:
+        return await flash(ctx, "There are no reports to back up yet.")
+    await ctx.bot.send_document(OWNER, document=raw, filename=f"hostel-backup-{today_iso()}.zip",
+                                caption=f"🗄 Backup of {count} report(s). Keep it safe: forward it to Saved Messages.")
+
+
+async def restore_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await asyncio.gather(tidy(update), flash(
+        ctx, "📥 To restore: send me the backup .zip file here.\nI add the days that are missing and never change a day that exists.",
+        seconds=15))
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """You send a backup zip: the missing days are added to History."""
+    doc = update.message.document
+    await tidy(update)
+    if not (doc.file_name or "").lower().endswith(".zip") or (doc.file_size or 0) > 5_000_000:
+        return await flash(ctx, "I can only read a backup .zip file (up to 5 MB).")
+    raw = bytes(await (await doc.get_file()).download_as_bytearray())
+    result = history.restore_zip(raw)
+    if result is None:
+        return await flash(ctx, "That zip file is not a valid backup.")
+    added, skipped, ignored = result
+    await flash(ctx, f"✅ Backup read: {added} report(s) added, {skipped} already there"
+                     + (f", {ignored} file(s) ignored" if ignored else "") + ".", seconds=15)
+
+
+async def weekly_backup(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every Sunday evening: a fresh backup. The previous weekly backup message is removed."""
+    raw, count = history.backup_zip()
+    if not count:
+        return
+    msg = await ctx.bot.send_document(OWNER, document=raw, filename=f"hostel-backup-{today_iso()}.zip",
+                                      caption=f"🗄 Weekly backup of {count} report(s). Forward it to Saved Messages to keep it safe.")
+    old = ctx.application.bot_data.get("backup_msg")
+    ctx.application.bot_data["backup_msg"] = msg.message_id
+    if old:
+        await delete_messages(ctx, [old])
+
+
 async def post_init(app: Application):
     """The blue "Menu" button next to the typing box. If Telegram is slow now, the bot still starts."""
     try:
@@ -912,19 +1448,24 @@ async def post_init(app: Application):
             BotCommand("start", "🏠 Home"),
             BotCommand("today", "📝 Today's report"),
             BotCommand("history", "📚 History"),
+            BotCommand("month", "📊 Month summary"),
+            BotCommand("backup", "🗄 Backup file"),
+            BotCommand("ping", "🏓 Speed test"),
         ])
     except Exception as e:
         logging.warning("Could not set the Menu button now (%s). The bot works anyway.", e)
 
 
 def make_request():
-    """Telegram connection. IPv4 only by default: a broken IPv6 route can make every click slow.
-    (To turn this off, write FORCE_IPV4=0 in .env)"""
-    kwargs = {}
-    if os.getenv("FORCE_IPV4", "1") == "1":
-        kwargs["httpx_kwargs"] = {"transport": httpx.AsyncHTTPTransport(local_address="0.0.0.0")}
+    """The connection to Telegram.
+    - It stays open for 2 minutes of silence (the default is 5 seconds), so a tap does not need a new
+      secure connection first. That setup alone can cost you a second or more.
+    - IPv4 only by default: a broken IPv6 route can make every click slow. (Turn off: FORCE_IPV4=0 in .env)"""
+    transport = httpx.AsyncHTTPTransport(
+        local_address="0.0.0.0" if os.getenv("FORCE_IPV4", "1") == "1" else None,
+        limits=httpx.Limits(max_connections=16, max_keepalive_connections=16, keepalive_expiry=120))
     return HTTPXRequest(connection_pool_size=16, connect_timeout=20, read_timeout=30,
-                        write_timeout=30, pool_timeout=10, **kwargs)
+                        write_timeout=30, pool_timeout=10, httpx_kwargs={"transport": transport})
 
 
 def start_health_server():
@@ -970,10 +1511,26 @@ def main():
     app.add_handler(CommandHandler("today", today_cmd, filters=only_me))
     app.add_handler(CommandHandler("history", history_cmd, filters=only_me))
     app.add_handler(CommandHandler("keyboard", keyboard_cmd, filters=only_me))
+    app.add_handler(CommandHandler("ping", ping_cmd, filters=only_me))
+    app.add_handler(CommandHandler("month", month_cmd, filters=only_me))
+    app.add_handler(CommandHandler("backup", backup_cmd, filters=only_me))
+    app.add_handler(CommandHandler("restore", restore_cmd, filters=only_me))
+    app.add_handler(MessageHandler(only_me & filters.COMMAND, unknown_cmd))     # any other command
+    app.add_handler(MessageHandler(only_me & filters.Document.ALL, on_document))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.job_queue.run_daily(reminder, time=reminder_time(), user_id=OWNER, chat_id=OWNER)
-    print(f"Bot is running. Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
+    app.job_queue.run_repeating(keep_warm, interval=40, first=5)
+    if os.getenv("PORT") and self_url():             # on Render: keep the free web service awake by itself
+        try:
+            minutes = min(max(int(os.getenv("SELF_PING_MINUTES", "5")), 1), 14)       # must be under 15
+        except ValueError:
+            minutes = 5
+        app.job_queue.run_repeating(self_ping, interval=minutes * 60, first=60)
+        print(f"Self-ping every {minutes} min to {self_url()}")
+    app.job_queue.run_daily(weekly_backup, time=time(22, 0, tzinfo=TZ), days=(0,))   # Sunday 22:00
+    print(f"Bot is running (version {VERSION}). Daily reminder at {reminder_time():%H:%M} (Cambodia time)")
     app.run_polling(bootstrap_retries=-1)   # if Telegram cannot be reached at start, keep trying
 
 

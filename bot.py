@@ -15,6 +15,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, PicklePersistence, filters)
 from telegram.request import HTTPXRequest
 
+import db
 import history
 import monthly
 import storage
@@ -33,7 +34,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER = int(os.environ["TELEGRAM_CHAT_ID"])  # only you can use the bot
 TZ = ZoneInfo("Asia/Phnom_Penh")
 PAGE = 8  # reports per page in History
-VERSION = "2026-11-02 storage+drafts+import"   # shown in /ping and in the log, to see which file runs
+VERSION = "2026-11-03 mongodb+storage+drafts+import"   # shown in /ping and in the log, to see which file runs
 
 # ---------- language (KH / EN) ----------
 _LANG = "en"
@@ -1142,6 +1143,17 @@ async def deliver_path(ctx, path, filename, screen, old_panel_id, keep=False):
         background(delete_messages(ctx, [old_panel_id]))
 
 
+async def deliver_bytes(ctx, raw, filename, screen, old_panel_id):
+    """Like deliver_path, for bytes that are not on disk (a stored file from MongoDB)."""
+    clear_files_later(ctx)
+    msg = await ctx.bot.send_document(OWNER, raw, filename=filename)
+    ctx.user_data.setdefault("files", []).append(msg.message_id)
+    panel = await ctx.bot.send_message(OWNER, screen[0], reply_markup=screen[1])
+    ctx.user_data["panel"] = panel.message_id
+    if old_panel_id:
+        background(delete_messages(ctx, [old_panel_id]))
+
+
 async def deliver_file(ctx, data, iso, screen, old_panel_id):
     """Old files out -> new file in -> a fresh menu UNDER the file, so the menu you use is always last."""
     clear_files_later(ctx)
@@ -1285,13 +1297,20 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await show(q, storage_screen(int(cmd.split(":")[1])))
     if cmd.startswith("st:v:"):
         iso = cmd.split(":", 2)[2]
-        path = storage.stored_report_path(iso)
-        if not path.exists():
+        raw = storage.get_stored_report(iso)
+        if raw is None:
             return await show(q, storage_screen(0, tr("file_gone")))
+        fd, tmp = tempfile.mkstemp(prefix=f"stored_{iso}_", suffix=".xlsx")
+        os.close(fd)
         try:
-            d, data, warnings = importer.read_report(path, original_name=f"{iso}.xlsx")
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            d, data, warnings = importer.read_report(tmp, original_name=f"{iso}.xlsx")
         except importer.BadFile as e:
             return await show(q, storage_screen(0, e.message))
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         text = import_body(data, dmy(iso))
         if warnings:
             text += "\n\n⚠️ " + "\n⚠️ ".join(esc(w) for w in warnings)
@@ -1300,10 +1319,10 @@ async def _on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [Btn(tr("storage_back"), callback_data="stor:0")]])))
     if cmd.startswith("st:f:"):
         iso = cmd.split(":", 2)[2]
-        path = storage.stored_report_path(iso)
-        if not path.exists():
+        raw = storage.get_stored_report(iso)
+        if raw is None:
             return await show(q, storage_screen(0, tr("file_gone")))
-        return await deliver_path(ctx, path, file_name(iso), storage_screen(0), q.message.message_id, keep=True)
+        return await deliver_bytes(ctx, raw, file_name(iso), storage_screen(0), q.message.message_id)
     if cmd.startswith("st:d:"):
         iso = cmd.split(":", 2)[2]
         return await show(q, (tr("delete_stored", date=dmy(iso)),
@@ -1817,8 +1836,13 @@ async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.get_me()
     took = perf_counter() - t0
     verdict = tr("fast") if took < 0.6 else (tr("ok") if took < 1.5 else tr("slow"))
+    if db.use_mongo():
+        storage_line = "MongoDB (connected)" if db.ping() else "MongoDB (UNREACHABLE)"
+    else:
+        storage_line = "local files"
     await asyncio.gather(tidy(update), flash(
-        ctx, tr("pong", t=f"{took:.2f}", verdict=verdict) + f"\n<i>version {VERSION}</i>", seconds=10))
+        ctx, tr("pong", t=f"{took:.2f}", verdict=verdict)
+        + f"\n<i>version {VERSION}</i>\nstorage: {storage_line}", seconds=10))
 
 
 async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1913,6 +1937,10 @@ async def weekly_backup(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     """The blue "Menu" button next to the typing box. If Telegram is slow now, the bot still starts."""
+    if db.use_mongo():
+        logging.info("Storage: MongoDB (%s)", "connected" if db.ping() else "UNREACHABLE")
+    else:
+        logging.info("Storage: local files (%s)", history.DATA_DIR)
     try:
         await app.bot.set_my_commands([
             BotCommand("start", "🏠 Home"),

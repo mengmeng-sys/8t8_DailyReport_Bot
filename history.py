@@ -1,4 +1,5 @@
-# history.py - saves every report you make, so you can open, update or delete it later
+# history.py - saves every report you make, so you can open, update or delete it later.
+# Storage: MongoDB when MONGODB_URI is set (Render), otherwise one small JSON file per day.
 import io
 import json
 import os
@@ -8,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+import db
 
 load_dotenv()
 # DATA_DIR = where your data is kept. On your computer: leave it empty (the bot folder is used).
@@ -20,13 +23,23 @@ def _path(iso):
     return HISTORY_DIR / f"{iso}.json"
 
 
+def _reports():
+    return db.mongo()["reports"]
+
+
 def save_report(iso, data):
+    if db.use_mongo():
+        _reports().replace_one({"_id": iso}, {"_id": iso, "date": iso, "data": data}, upsert=True)
+        return
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     _path(iso).write_text(json.dumps({"date": iso, "data": data}, ensure_ascii=False, indent=1),
                           encoding="utf-8")
 
 
 def load_report(iso):
+    if db.use_mongo():
+        doc = _reports().find_one({"_id": iso})
+        return doc["data"] if doc else None
     try:
         return json.loads(_path(iso).read_text(encoding="utf-8"))["data"]
     except (OSError, ValueError, KeyError):
@@ -34,6 +47,8 @@ def load_report(iso):
 
 
 def delete_report(iso):
+    if db.use_mongo():
+        return _reports().delete_one({"_id": iso}).deleted_count > 0
     p = _path(iso)
     if p.exists():
         p.unlink()
@@ -43,6 +58,16 @@ def delete_report(iso):
 
 def list_reports():
     """Newest first, as 'YYYY-MM-DD' texts."""
+    if db.use_mongo():
+        days = []
+        for doc in _reports().find({}, {"_id": 1}):
+            iso = doc.get("_id")
+            try:
+                datetime.strptime(iso, "%Y-%m-%d")
+                days.append(iso)
+            except (TypeError, ValueError):
+                pass
+        return sorted(days, reverse=True)
     if not HISTORY_DIR.exists():
         return []
     days = []
@@ -64,7 +89,14 @@ def backup_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for iso in days:
-            z.write(_path(iso), arcname=f"{iso}.json")
+            if db.use_mongo():
+                data = load_report(iso)
+                if data is None:
+                    continue
+                z.writestr(f"{iso}.json",
+                           json.dumps({"date": iso, "data": data}, ensure_ascii=False, indent=1))
+            else:
+                z.write(_path(iso), arcname=f"{iso}.json")
     return buf.getvalue(), len(days)
 
 
@@ -95,7 +127,7 @@ def restore_zip(raw):
             except (ValueError, KeyError, TypeError, UnicodeDecodeError):
                 ignored += 1
                 continue
-            if _path(iso).exists():
+            if load_report(iso) is not None:
                 skipped += 1
                 continue
             save_report(iso, data)

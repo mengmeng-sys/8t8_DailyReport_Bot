@@ -16,11 +16,16 @@ if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 import history  # noqa: E402
+import db  # noqa: E402
 from telegram import Update  # noqa: E402
 from telegram.request import HTTPXRequest  # noqa: E402
 
 OWNER = 984488956
 DATE = 1700000000
+
+# Tests use the local file backend unless a test asks for MongoDB (the `mongo` fixture).
+# Setting it to "" also stops load_dotenv() from re-reading it out of a local .env.
+os.environ["MONGODB_URI"] = ""
 
 
 def _ok(result):
@@ -209,3 +214,17 @@ def harness(tmp_path, monkeypatch):
     h = Harness(fake, tmp_path)
     yield h
     run(h.stop())
+
+
+@pytest.fixture
+def mongo(monkeypatch):
+    """Force the MongoDB backend on an in-memory mongomock database."""
+    import mongomock
+    import mongomock.gridfs
+    mongomock.gridfs.enable_gridfs_integration()
+    client = mongomock.MongoClient()
+    mdb = client["test_hostel_bot"]
+    monkeypatch.setenv("MONGODB_URI", "mongodb://test")
+    monkeypatch.setattr(db, "_client", client)
+    monkeypatch.setattr(db, "_db", mdb)
+    return mdb

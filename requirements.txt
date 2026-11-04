@@ -5,3 +5,4 @@ python-dotenv
 tzdata
 faster-whisper
 av<19
+pymongo

@@ -22,6 +22,43 @@ disk on Render. It works offline and costs nothing.
 
 If the bot cannot understand you, it says so and asks you to repeat or type.
 
+## Keep your data safe (MongoDB)
+
+On Render's free tier the disk is wiped every time the service restarts or you
+redeploy, so anything written to disk (History, drafts, stored files) is lost.
+The bot can store everything in **MongoDB** instead, which survives redeploys.
+
+The bot picks the storage automatically:
+
+- **`MONGODB_URI` set** → everything is stored in MongoDB (reports, drafts,
+  undo trash, and the files you sent).
+- **`MONGODB_URI` empty** → the bot uses the local `history/` and
+  `storage/` folders (good for your computer and for the tests).
+
+### Set it up (about 10 minutes, free)
+
+1. Create a free cluster at **[mongodb.com/atlas](https://www.mongodb.com/atlas)**
+   (M0 free tier is enough).
+2. **Database Access** → add a database user (remember the password).
+3. **Network Access** → add `0.0.0.0/0` (allow anywhere). Render's IP changes on
+   every deploy, so a fixed IP does not work. This is safe enough for a small
+   private database protected by a username and password.
+4. **Database** → **Connect** → copy the **connection string**. It looks like:
+   `mongodb+srv://myuser:<password>@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority`
+5. In your **Render dashboard** → the bot service → **Environment**, add:
+   - `MONGODB_URI` = the connection string (replace `<password>` with the real
+     password, and URL-encode any `@ : / ? #` characters in it)
+   - `MONGODB_DB` = `hostel_bot` (optional, this is the default)
+6. **Deploy** the service again.
+
+Send `/ping`: the answer now ends with `storage: MongoDB (connected)`. From then
+on, every report, draft and stored file is kept in MongoDB, so a redeploy no
+longer loses anything. `/backup` still works and produces the same zip, so you
+can keep a copy in Telegram Saved Messages.
+
+> If `/ping` says `MongoDB (UNREACHABLE)`, check the connection string, the
+> database user password, and the Network Access list.
+
 ## 0. Language (KH / EN)
 
 The bot speaks **English** and **Khmer**. Switch with the `/lang` command or the
@@ -93,9 +130,10 @@ stored files, and **never** overwrites a day or a file that already exists.
 
 ## 5. New files
 
+- `db.py` - MongoDB connection (used only when `MONGODB_URI` is set).
 - `storage.py` - drafts, stored files, trash (undo), storage backup/restore.
 - `importer.py` - `read_report(path) -> (date, data, warnings)`.
-- `tests/` - pytest tests (fake Telegram, no internet).
+- `tests/` - pytest tests (fake Telegram, no internet; MongoDB tests use mongomock).
 
 ## 6. Try it by hand in Telegram (about 5 minutes)
 

@@ -141,3 +141,29 @@ def test_ping_shows_storage(harness, mongo):
         await h.stop()
 
     run(scenario(harness))
+
+
+def test_unreachable_falls_back_to_files(harness, monkeypatch):
+    """If Atlas cannot be reached, the bot still works with local files."""
+    monkeypatch.setenv("MONGODB_URI", "mongodb://test")
+    db.reset()
+    monkeypatch.setattr(db, "ping", lambda: False)
+    assert db.status() == "unreachable"
+    assert db.use_mongo() is False
+    history.save_report("2026-10-20", {"rooms": {"pool": [1, 2, 3]}})
+    assert history.load_report("2026-10-20") == {"rooms": {"pool": [1, 2, 3]}}
+    storage.save_draft({"date": "2026-10-20", "data": {"rooms": {}}})
+    assert storage.load_draft("2026-10-20")["data"] == {"rooms": {}}
+
+
+def test_ping_shows_unreachable(harness, monkeypatch):
+    async def scenario(h):
+        monkeypatch.setenv("MONGODB_URI", "mongodb://test")
+        db.reset()
+        monkeypatch.setattr(db, "ping", lambda: False)
+        await h.start()
+        await h.msg("/ping")
+        assert "UNREACHABLE" in h.last_text(), h.last_text()
+        await h.stop()
+
+    run(scenario(harness))

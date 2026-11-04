@@ -59,6 +59,22 @@ can keep a copy in Telegram Saved Messages.
 > If `/ping` says `MongoDB (UNREACHABLE)`, check the connection string, the
 > database user password, and the Network Access list.
 
+### Troubleshooting: `SSL handshake failed ... TLSV1_ALERT_INTERNAL_ERROR`
+
+This exact error means **Atlas refused the connection because the IP address is
+not on the Network Access allowlist** (Atlas rejects the TLS handshake for
+non-allow-listed IPs). Fix it:
+
+1. Atlas → **Network Access** → **Add IP Address** → **Allow Access from
+   Anywhere** (`0.0.0.0/0`).
+2. Wait until the entry says **Active** (this can take a few minutes).
+3. Redeploy the Render service and send `/ping` again.
+
+While Atlas is unreachable, the bot does **not** crash: it logs a warning and
+uses the local files instead, and `/ping` says
+`MongoDB (UNREACHABLE - using local files)`. Data written in that state is not
+safe across a redeploy, so fix the allowlist as soon as you can.
+
 ## 0. Language (KH / EN)
 
 The bot speaks **English** and **Khmer**. Switch with the `/lang` command or the

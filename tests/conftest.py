@@ -222,9 +222,11 @@ def mongo(monkeypatch):
     import mongomock
     import mongomock.gridfs
     mongomock.gridfs.enable_gridfs_integration()
+    db.reset()
     client = mongomock.MongoClient()
     mdb = client["test_hostel_bot"]
     monkeypatch.setenv("MONGODB_URI", "mongodb://test")
     monkeypatch.setattr(db, "_client", client)
     monkeypatch.setattr(db, "_db", mdb)
+    monkeypatch.setattr(db, "_backend", "mongo")
     return mdb

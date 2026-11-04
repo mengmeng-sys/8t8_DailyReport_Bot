@@ -1836,10 +1836,9 @@ async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.get_me()
     took = perf_counter() - t0
     verdict = tr("fast") if took < 0.6 else (tr("ok") if took < 1.5 else tr("slow"))
-    if db.use_mongo():
-        storage_line = "MongoDB (connected)" if db.ping() else "MongoDB (UNREACHABLE)"
-    else:
-        storage_line = "local files"
+    storage_line = {"mongo": "MongoDB (connected)",
+                    "unreachable": "MongoDB (UNREACHABLE - using local files)",
+                    "files": "local files"}[db.status()]
     await asyncio.gather(tidy(update), flash(
         ctx, tr("pong", t=f"{took:.2f}", verdict=verdict)
         + f"\n<i>version {VERSION}</i>\nstorage: {storage_line}", seconds=10))
@@ -1937,8 +1936,20 @@ async def weekly_backup(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     """The blue "Menu" button next to the typing box. If Telegram is slow now, the bot still starts."""
-    if db.use_mongo():
-        logging.info("Storage: MongoDB (%s)", "connected" if db.ping() else "UNREACHABLE")
+    backend = db.choose_backend()
+    if backend == "mongo":
+        logging.info("Storage: MongoDB (connected)")
+    elif db.configured():
+        logging.warning("MongoDB is configured but unreachable; using local files")
+        try:
+            await app.bot.send_message(
+                OWNER,
+                "⚠️ MongoDB is unreachable, so the bot is using local files. "
+                "Your data will NOT survive a redeploy.\n"
+                "Fix: in MongoDB Atlas → Network Access, add 0.0.0.0/0 "
+                "(Allow Access from Anywhere), then redeploy.")
+        except Exception:
+            pass
     else:
         logging.info("Storage: local files (%s)", history.DATA_DIR)
     try:
